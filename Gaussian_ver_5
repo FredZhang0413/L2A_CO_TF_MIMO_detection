@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""
+Dynamic Graph-Context Learning-to-Anneal Transformer for hard 32x32 16-QAM MIMO detection.
+
+Finalized toy simulation plan:
+- Point-to-point centralized MIMO: y = Hx + n, H in C^{32x32}.
+- 16-QAM, 4 coded bits per symbol, 128 hard-decision bits per MIMO vector.
+- No channel decoding.
+- Main metric: BER.
+- Training objective: unsupervised ML residual energy with policy-gradient.
+- Dynamic MIMO context embedding across layers.
+- Node embedding: local likelihood terms from z = H^H y and diag(R), R = H^H H.
+- Edge embedding: complex pairwise interference terms from R_ij used as attention bias.
+- Generation rule: across-symbol autoregressive; within-symbol I/Q-separated direct bit-value mean-field Bernoulli.
+- Multiple parallel simulators: fully random valid 16-QAM initial states.
+- Per-layer two-phase greedy local search with multi-symbol and single-symbol Gray-neighbor moves.
+- Baselines: ZF, LMMSE, and exact ML sphere decoding on a compact fixed test subset.
+
+This script is intentionally self-contained. It can be run as a smoke test on CPU, or trained on GPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def complex_normal(shape, device, dtype=torch.complex64, scale: float = 1.0) -> torch.Tensor:
+    """Generate circular complex Gaussian samples CN(0, scale^2)."""
+    real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+    x = torch.randn(*shape, device=device, dtype=real_dtype)
+    y = torch.randn(*shape, device=device, dtype=real_dtype)
+    return (scale / math.sqrt(2.0)) * (x + 1j * y)
+
+
+# Gray-coded 4-PAM per real dimension:
+# bits 00 -> -3, 01 -> -1, 11 -> +1, 10 -> +3
+PAIR_TO_LEVEL = {
+    (0, 0): -3,
+    (0, 1): -1,
+    (1, 1): +1,
+    (1, 0): +3,
+}
+LEVEL_TO_PAIR = {
+    -3: (0, 0),
+    -1: (0, 1),
+    +1: (1, 1),
+    +3: (1, 0),
+}
+LEVELS = torch.tensor([-3.0, -1.0, 1.0, 3.0])
+QAM_NORM = math.sqrt(10.0)
+
+
+def bits_to_level(bits2: torch.Tensor) -> torch.Tensor:
+    """Map two bits (..., 2) to Gray-coded 4-PAM levels in {-3,-1,+1,+3}."""
+    b0 = bits2[..., 0].long()
+    b1 = bits2[..., 1].long()
+    # 00 -> 0, 01 -> 1, 11 -> 2, 10 -> 3 in level index [-3,-1,1,3]
+    idx = torch.empty_like(b0)
+    idx[(b0 == 0) & (b1 == 0)] = 0
+    idx[(b0 == 0) & (b1 == 1)] = 1
+    idx[(b0 == 1) & (b1 == 1)] = 2
+    idx[(b0 == 1) & (b1 == 0)] = 3
+    return LEVELS.to(bits2.device)[idx]
+
+
+def level_to_bits(levels: torch.Tensor) -> torch.Tensor:
+    """Map nearest 4-PAM levels to Gray-coded two-bit labels."""
+    levels_device = LEVELS.to(levels.device)
+    dist = (levels[..., None] - levels_device) ** 2
+    idx = dist.argmin(dim=-1)
+    out = torch.zeros(*levels.shape, 2, device=levels.device, dtype=torch.float32)
+    # index 0 -> 00, 1 -> 01, 2 -> 11, 3 -> 10
+    out[idx == 0] = torch.tensor([0.0, 0.0], device=levels.device)
+    out[idx == 1] = torch.tensor([0.0, 1.0], device=levels.device)
+    out[idx == 2] = torch.tensor([1.0, 1.0], device=levels.device)
+    out[idx == 3] = torch.tensor([1.0, 0.0], device=levels.device)
+    return out
+
+
+def bits_to_qam(bits: torch.Tensor) -> torch.Tensor:
+    """Map bits (..., Nt, 4) to normalized 16-QAM symbols (..., Nt)."""
+    real_level = bits_to_level(bits[..., 0:2])
+    imag_level = bits_to_level(bits[..., 2:4])
+    return (real_level + 1j * imag_level).to(torch.complex64) / QAM_NORM
+
+
+def qam_to_bits(x: torch.Tensor) -> torch.Tensor:
+    """Hard-slice complex symbols to normalized 16-QAM and return bits (..., Nt, 4)."""
+    xr = (x.real * QAM_NORM).clamp(-3.0, 3.0)
+    xi = (x.imag * QAM_NORM).clamp(-3.0, 3.0)
+    br = level_to_bits(xr)
+    bi = level_to_bits(xi)
+    return torch.cat([br, bi], dim=-1)
+
+
+def qam_slice(x: torch.Tensor) -> torch.Tensor:
+    """Hard-slice complex symbols to normalized 16-QAM points."""
+    return bits_to_qam(qam_to_bits(x))
+
+
+def qam_constellation(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return all 16 valid Gray-labeled 16-QAM bit labels and symbols."""
+    bits = torch.tensor(
+        [[(idx >> bit) & 1 for bit in (3, 2, 1, 0)] for idx in range(16)],
+        device=device,
+        dtype=torch.float32,
+    )
+    symbols = bits_to_qam(bits.view(16, 1, 4)).view(16)
+    return bits, symbols
+
+
+def residual_energy(bits: torch.Tensor, H: torch.Tensor, y: torch.Tensor, sigma2: float) -> torch.Tensor:
+    """Normalized residual energy f(b;G) = ||y - H M(b)||^2 / (Nr sigma^2).
+
+    bits shape: (B, K, Nt, 4) or (B, Nt, 4)
+    H shape: (B, Nr, Nt)
+    y shape: (B, Nr)
+    returns: (B, K) or (B,)
+    """
+    if bits.dim() == 4:
+        B, K, Nt, _ = bits.shape
+        x = bits_to_qam(bits)  # (B, K, Nt)
+        H_expand = H[:, None, :, :]  # (B, 1, Nr, Nt)
+        pred = torch.matmul(H_expand, x[..., None]).squeeze(-1)  # (B, K, Nr)
+        err = y[:, None, :] - pred
+        Nr = H.shape[1]
+        return (err.abs() ** 2).sum(dim=-1).real / (Nr * sigma2)
+    elif bits.dim() == 3:
+        x = bits_to_qam(bits)  # (B, Nt)
+        pred = torch.matmul(H, x[..., None]).squeeze(-1)
+        err = y - pred
+        Nr = H.shape[1]
+        return (err.abs() ** 2).sum(dim=-1).real / (Nr * sigma2)
+    raise ValueError(f"Unsupported bits dimension: {bits.shape}")
+
+
+def bit_error_rate(pred_bits: torch.Tensor, true_bits: torch.Tensor) -> float:
+    return (pred_bits.round().long() != true_bits.round().long()).float().mean().item()
+
+
+# -----------------------------
+# Data generation and baselines
+# -----------------------------
+
+
+@dataclass
+class MIMOConfig:
+    Nt: int = 32
+    Nr: int = 32
+    snr_db: float = 15.0
+
+    @property
+    def sigma2(self) -> float:
+        return 10.0 ** (-self.snr_db / 10.0)
+
+
+def generate_batch(batch_size: int, cfg: MIMOConfig, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return H, y, true_bits, true_x."""
+    H = complex_normal((batch_size, cfg.Nr, cfg.Nt), device=device, scale=1.0 / math.sqrt(cfg.Nt))
+    true_bits = torch.randint(0, 2, (batch_size, cfg.Nt, 4), device=device).float()
+    x = bits_to_qam(true_bits)
+    noise = complex_normal((batch_size, cfg.Nr), device=device, scale=math.sqrt(cfg.sigma2))
+    y = torch.matmul(H, x[..., None]).squeeze(-1) + noise
+    return H, y, true_bits, x
+
+
+def linear_detector_bits(H: torch.Tensor, y: torch.Tensor, sigma2: float, kind: str = "lmmse") -> torch.Tensor:
+    """ZF or LMMSE hard-sliced bit estimates."""
+    B, Nr, Nt = H.shape
+    Hh = H.conj().transpose(-1, -2)
+    R = torch.matmul(Hh, H)
+    z = torch.matmul(Hh, y[..., None]).squeeze(-1)
+    eye = torch.eye(Nt, device=H.device, dtype=H.dtype)[None, :, :]
+    if kind.lower() == "lmmse":
+        A = R + sigma2 * eye
+    elif kind.lower() == "zf":
+        A = R + 1e-8 * eye
+    else:
+        raise ValueError("kind must be 'zf' or 'lmmse'")
+    x_hat = torch.linalg.solve(A, z[..., None]).squeeze(-1)
+    return qam_to_bits(x_hat)
+
+
+@torch.no_grad()
+def exact_ml_sphere_decode_bits(H: torch.Tensor, y: torch.Tensor, sigma2: float) -> torch.Tensor:
+    """Exact finite-alphabet ML detection using QR sphere decoding.
+
+    The branch-and-bound search enumerates 16-QAM symbols in Schnorr-Euchner
+    order and uses the LMMSE hard slice as an initial radius. This benchmark is
+    intended for a small fixed test subset rather than every validation batch.
+    """
+    H_cpu = H.detach().to(device="cpu", dtype=torch.complex128)
+    y_cpu = y.detach().to(device="cpu", dtype=torch.complex128)
+    const_bits, const_symbols = qam_constellation(torch.device("cpu"))
+    const_symbols = const_symbols.to(torch.complex128)
+    B, _, Nt = H_cpu.shape
+    detected: List[torch.Tensor] = []
+
+    for batch_idx in range(B):
+        Hb = H_cpu[batch_idx]
+        yb = y_cpu[batch_idx]
+        Q, R = torch.linalg.qr(Hb, mode="reduced")
+        y_tilde = Q.conj().transpose(-1, -2) @ yb
+
+        Hh = Hb.conj().transpose(-1, -2)
+        eye = torch.eye(Nt, dtype=torch.complex128)
+        x_lmmse = torch.linalg.solve(Hh @ Hb + sigma2 * eye, Hh @ yb)
+        best_x = qam_slice(x_lmmse.to(torch.complex64)).to(torch.complex128)
+        best_metric = float(((yb - Hb @ best_x).abs() ** 2).sum().real.item())
+        work_x = best_x.clone()
+
+        def search(level: int, partial_metric: float) -> None:
+            nonlocal best_metric, best_x
+            if level < 0:
+                best_metric = partial_metric
+                best_x = work_x.clone()
+                return
+
+            interference = (R[level, level + 1 :] @ work_x[level + 1 :]) if level + 1 < Nt else 0.0
+            target = y_tilde[level] - interference
+            branch_metric = ((target - R[level, level] * const_symbols).abs() ** 2).real
+            for symbol_idx in torch.argsort(branch_metric).tolist():
+                candidate_metric = partial_metric + float(branch_metric[symbol_idx].item())
+                if candidate_metric <= best_metric + 1e-12:
+                    work_x[level] = const_symbols[symbol_idx]
+                    search(level - 1, candidate_metric)
+
+        search(Nt - 1, 0.0)
+        detected.append(qam_to_bits(best_x.to(torch.complex64).view(1, Nt)).squeeze(0))
+
+    return torch.stack(detected, dim=0).to(H.device)
+
+
+@torch.no_grad()
+def evaluate_exact_ml_baseline(
+    H: torch.Tensor,
+    y: torch.Tensor,
+    true_bits: torch.Tensor,
+    sigma2: float,
+) -> Dict[str, float]:
+    ml_bits = exact_ml_sphere_decode_bits(H, y, sigma2)
+    return {
+        "ber": bit_error_rate(ml_bits, true_bits),
+        "residual_energy": residual_energy(ml_bits, H, y, sigma2).mean().item(),
+    }
+
+
+@torch.no_grad()
+def kbest_ml_surrogate_bits(H: torch.Tensor, y: torch.Tensor, beam_width: int = 256) -> torch.Tensor:
+    """Lower-complexity branch-search surrogate for ML detection.
+
+    This is a QR-domain K-best tree search. It keeps the best ``beam_width``
+    partial symbol vectors at each layer, so it is not exact ML, but it is a
+    much stronger finite-alphabet reference than one-shot linear slicing.
+    """
+    H_cpu = H.detach().to(device="cpu", dtype=torch.complex128)
+    y_cpu = y.detach().to(device="cpu", dtype=torch.complex128)
+    _, const_symbols = qam_constellation(torch.device("cpu"))
+    const_symbols = const_symbols.to(torch.complex128)
+    B, _, Nt = H_cpu.shape
+    beam_width = max(1, int(beam_width))
+    detected: List[torch.Tensor] = []
+
+    for batch_idx in range(B):
+        Hb = H_cpu[batch_idx]
+        yb = y_cpu[batch_idx]
+        Q, R = torch.linalg.qr(Hb, mode="reduced")
+        y_tilde = Q.conj().transpose(-1, -2) @ yb
+        paths = torch.zeros(1, Nt, dtype=torch.complex128)
+        metrics = torch.zeros(1, dtype=torch.float64)
+
+        for level in range(Nt - 1, -1, -1):
+            if level + 1 < Nt:
+                interference = (paths[:, level + 1 :] * R[level, level + 1 :]).sum(dim=1)
+            else:
+                interference = torch.zeros(paths.shape[0], dtype=torch.complex128)
+            target = y_tilde[level] - interference
+            branch_metric = ((target[:, None] - R[level, level] * const_symbols[None, :]).abs() ** 2).real
+            candidate_metric = metrics[:, None] + branch_metric
+            flat_metric = candidate_metric.reshape(-1)
+            keep = min(beam_width, flat_metric.numel())
+            best_metric, best_flat = torch.topk(flat_metric, keep, largest=False)
+            parent_idx = torch.div(best_flat, const_symbols.numel(), rounding_mode="floor")
+            symbol_idx = best_flat.remainder(const_symbols.numel())
+            paths = paths[parent_idx].clone()
+            paths[:, level] = const_symbols[symbol_idx]
+            metrics = best_metric
+
+        detected.append(qam_to_bits(paths[metrics.argmin()].to(torch.complex64).view(1, Nt)).squeeze(0))
+
+    return torch.stack(detected, dim=0).to(H.device)
+
+
+@torch.no_grad()
+def evaluate_ml_reference(
+    H: torch.Tensor,
+    y: torch.Tensor,
+    true_bits: torch.Tensor,
+    sigma2: float,
+    mode: str,
+    beam_width: int,
+) -> Dict[str, float | str]:
+    if mode == "exact":
+        bits = exact_ml_sphere_decode_bits(H, y, sigma2)
+        label = "exact"
+    elif mode == "kbest":
+        bits = kbest_ml_surrogate_bits(H, y, beam_width=beam_width)
+        label = f"kbest{int(beam_width)}"
+    else:
+        raise ValueError(f"Unsupported ML reference mode: {mode}")
+    return {
+        "ber": bit_error_rate(bits, true_bits),
+        "residual_energy": residual_energy(bits, H, y, sigma2).mean().item(),
+        "mode": label,
+    }
+
+
+def neighbor_perturb_bits(bits: torch.Tensor, p_symbol: float = 0.25) -> torch.Tensor:
+    """Perturb each selected 16-QAM symbol to a valid neighboring constellation point.
+
+    The perturbation changes either the real-axis or imaginary-axis 4-PAM level by one step.
+    This preserves constellation validity and searches adjacent valid points.
+
+    bits shape: (B, Nt, 4)
+    """
+    device = bits.device
+    out = bits.clone()
+    B, Nt, _ = bits.shape
+    perturb_mask = torch.rand(B, Nt, device=device) < p_symbol
+
+    # Convert current bits to level indices 0..3 for real and imag axes.
+    real_level = bits_to_level(out[..., 0:2])
+    imag_level = bits_to_level(out[..., 2:4])
+    levels_device = LEVELS.to(device)
+    real_idx = ((real_level[..., None] - levels_device) ** 2).argmin(dim=-1)
+    imag_idx = ((imag_level[..., None] - levels_device) ** 2).argmin(dim=-1)
+
+    choose_real = torch.rand(B, Nt, device=device) < 0.5
+    step = torch.where(torch.rand(B, Nt, device=device) < 0.5, -torch.ones(B, Nt, device=device, dtype=torch.long), torch.ones(B, Nt, device=device, dtype=torch.long))
+
+    def valid_move(idx, st):
+        # If a boundary move would leave the constellation, reverse it.
+        st = torch.where((idx == 0) & (st < 0), torch.ones_like(st), st)
+        st = torch.where((idx == 3) & (st > 0), -torch.ones_like(st), st)
+        return (idx + st).clamp(0, 3)
+
+    new_real_idx = valid_move(real_idx, step)
+    new_imag_idx = valid_move(imag_idx, step)
+
+    new_real_levels = levels_device[new_real_idx]
+    new_imag_levels = levels_device[new_imag_idx]
+    new_real_bits = level_to_bits(new_real_levels)
+    new_imag_bits = level_to_bits(new_imag_levels)
+
+    use_real = perturb_mask & choose_real
+    use_imag = perturb_mask & (~choose_real)
+    out[..., 0:2] = torch.where(use_real[..., None], new_real_bits, out[..., 0:2])
+    out[..., 2:4] = torch.where(use_imag[..., None], new_imag_bits, out[..., 2:4])
+    return out
+
+
+def initialize_simulators(
+    H: torch.Tensor,
+    y: torch.Tensor,
+    sigma2: float,
+    K: int,
+    p_symbol: float,
+    strong_p_symbol: float = 0.6,
+) -> torch.Tensor:
+    """Create K fully random valid 16-QAM simulator states.
+
+    The channel and perturbation arguments are intentionally unused here. They
+    are kept in the signature so training/evaluation call sites can stay shared
+    with older LMMSE-anchored variants.
+    """
+    del y, sigma2, p_symbol, strong_p_symbol
+    B, _, Nt = H.shape
+    return torch.randint(0, 2, (B, K, Nt, 4), device=H.device).float()
+
+
+@torch.no_grad()
+def local_search_refine_bits(
+    bits: torch.Tensor,
+    H: torch.Tensor,
+    y: torch.Tensor,
+    sigma2: float,
+    sweeps: int = 1,
+    multi_rounds: int = 2,
+    topk_symbols: int = 2,
+) -> torch.Tensor:
+    """Two-phase greedy Gray-neighbor local search for 16-QAM solutions.
+
+    Phase 1 performs ``multi_rounds`` coarse updates. At each round, it scores
+    the best one-hop Gray move for every QAM symbol, simultaneously proposes the
+    moves for the top-``topk_symbols`` symbols, and accepts the joint move only
+    when it lowers residual energy. Phase 2 sequentially visits every symbol and
+    accepts its best energy-decreasing one-hop Gray move.
+    """
+    if sweeps <= 0 and multi_rounds <= 0:
+        return bits
+
+    B, K, Nt, _ = bits.shape
+    Nr = H.shape[1]
+    device = bits.device
+    levels = LEVELS.to(device)
+    delta_real = torch.tensor([-1, 1, 0, 0], device=device, dtype=torch.long)
+    delta_imag = torch.tensor([0, 0, -1, 1], device=device, dtype=torch.long)
+
+    x = bits_to_qam(bits.float())  # (B, K, Nt)
+    H_expand = H[:, None, :, :]  # (B, 1, Nr, Nt)
+    residual = y[:, None, :] - torch.matmul(H_expand, x[..., None]).squeeze(-1)  # (B, K, Nr)
+
+    real_level = bits_to_level(bits[..., 0:2])
+    imag_level = bits_to_level(bits[..., 2:4])
+    real_idx = ((real_level[..., None] - levels) ** 2).argmin(dim=-1)
+    imag_idx = ((imag_level[..., None] - levels) ** 2).argmin(dim=-1)
+    h_norm_sq = (H.abs() ** 2).sum(dim=1).real  # (B, Nt)
+
+    def best_gray_move(i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hi = H[:, :, i]  # (B, Nr)
+        old_xi = x[:, :, i]  # (B, K)
+        ri = real_idx[:, :, i]
+        qi = imag_idx[:, :, i]
+        valid_moves = torch.stack([ri > 0, ri < 3, qi > 0, qi < 3], dim=-1)
+        new_ri = (ri[..., None] + delta_real).clamp(0, 3)
+        new_qi = (qi[..., None] + delta_imag).clamp(0, 3)
+        new_xi = ((levels[new_ri] + 1j * levels[new_qi]) / QAM_NORM).to(H.dtype)
+        delta_x = new_xi - old_xi[..., None]
+        hi_h_residual = (hi.conj()[:, None, :] * residual).sum(dim=-1)
+        delta_energy = (
+            (delta_x.abs() ** 2) * h_norm_sq[:, i, None, None]
+            - 2.0 * torch.real(delta_x.conj() * hi_h_residual[..., None])
+        ) / (Nr * sigma2)
+        delta_energy = delta_energy.masked_fill(~valid_moves, float("inf"))
+        best_delta_energy, best_move = delta_energy.min(dim=-1)
+        gather_idx = best_move[..., None]
+        best_delta_x = delta_x.gather(dim=-1, index=gather_idx).squeeze(-1)
+        best_ri = new_ri.gather(dim=-1, index=gather_idx).squeeze(-1)
+        best_qi = new_qi.gather(dim=-1, index=gather_idx).squeeze(-1)
+        return best_delta_energy, best_delta_x, best_ri, best_qi
+
+    num_multi = max(0, int(multi_rounds))
+    num_hops = min(max(0, int(topk_symbols)), Nt)
+    for _ in range(num_multi):
+        if num_hops == 0:
+            break
+        scores: List[torch.Tensor] = []
+        deltas: List[torch.Tensor] = []
+        proposed_real: List[torch.Tensor] = []
+        proposed_imag: List[torch.Tensor] = []
+        for i in range(Nt):
+            score_i, delta_i, real_i, imag_i = best_gray_move(i)
+            scores.append(score_i)
+            deltas.append(delta_i)
+            proposed_real.append(real_i)
+            proposed_imag.append(imag_i)
+
+        scores_stack = torch.stack(scores, dim=-1)  # (B, K, Nt)
+        deltas_stack = torch.stack(deltas, dim=-1)
+        proposed_real_stack = torch.stack(proposed_real, dim=-1)
+        proposed_imag_stack = torch.stack(proposed_imag, dim=-1)
+        selected = scores_stack.topk(num_hops, dim=-1, largest=False).indices
+        selected_mask = torch.zeros(B, K, Nt, device=device, dtype=torch.bool).scatter_(dim=-1, index=selected, value=True)
+
+        joint_delta = torch.where(selected_mask, deltas_stack, torch.zeros_like(deltas_stack))
+        candidate_x = x + joint_delta
+        candidate_residual = residual - torch.einsum("brn,bkn->bkr", H, joint_delta)
+        current_energy = (residual.abs() ** 2).sum(dim=-1).real
+        candidate_energy = (candidate_residual.abs() ** 2).sum(dim=-1).real
+        accept = candidate_energy < current_energy
+        candidate_real = torch.where(selected_mask, proposed_real_stack, real_idx)
+        candidate_imag = torch.where(selected_mask, proposed_imag_stack, imag_idx)
+        x = torch.where(accept[..., None], candidate_x, x)
+        residual = torch.where(accept[..., None], candidate_residual, residual)
+        real_idx = torch.where(accept[..., None], candidate_real, real_idx)
+        imag_idx = torch.where(accept[..., None], candidate_imag, imag_idx)
+
+    for _ in range(max(0, int(sweeps))):
+        for i in range(Nt):
+            delta_energy, delta_x, new_ri, new_qi = best_gray_move(i)
+            accept = delta_energy < 0.0
+            accepted_delta = torch.where(accept, delta_x, torch.zeros_like(delta_x))
+            x[:, :, i] = x[:, :, i] + accepted_delta
+            residual = residual - H[:, None, :, i] * accepted_delta[:, :, None]
+            real_idx[:, :, i] = torch.where(accept, new_ri, real_idx[:, :, i])
+            imag_idx[:, :, i] = torch.where(accept, new_qi, imag_idx[:, :, i])
+
+    real_bits = level_to_bits(levels[real_idx])
+    imag_bits = level_to_bits(levels[imag_idx])
+    return torch.cat([real_bits, imag_bits], dim=-1)
+
+
+# -----------------------------
+# Model components
+# -----------------------------
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, layers: int = 2):
+        super().__init__()
+        if layers == 1:
+            self.net = nn.Linear(in_dim, out_dim)
+        else:
+            mods: List[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+            for _ in range(layers - 2):
+                mods += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            mods.append(nn.Linear(hidden_dim, out_dim))
+            self.net = nn.Sequential(*mods)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class EdgeBiasedTransformerBlock(nn.Module):
+    """Self-attention block with complex edge-derived attention bias."""
+    def __init__(self, d_model: int, num_heads: int, d_ff: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.edge_mlp = MLP(4, d_ff, num_heads, layers=2)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model))
+
+    def forward(self, h: torch.Tensor, edge_feat: torch.Tensor) -> torch.Tensor:
+        """
+        h: (BK, Nt, d_model)
+        edge_feat: (BK, Nt, Nt, 4)
+        """
+        x = self.ln1(h)
+        BK, Nt, _ = x.shape
+        qkv = self.qkv(x).view(BK, Nt, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]  # (BK, Nt, H, Dh)
+        q = q.transpose(1, 2)  # (BK, H, Nt, Dh)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        edge_bias = self.edge_mlp(edge_feat).permute(0, 3, 1, 2)  # (BK, H, Nt, Nt)
+        diag_mask = torch.eye(Nt, device=edge_bias.device, dtype=torch.bool)[None, None, :, :]
+        edge_bias = edge_bias.masked_fill(diag_mask, 0.0)
+        attn = torch.softmax(logits + edge_bias, dim=-1)
+        ctx = torch.matmul(attn, v).transpose(1, 2).contiguous().view(BK, Nt, self.d_model)
+        h = h + self.out(ctx)
+        h = h + self.ffn(self.ln2(h))
+        return h
+
+
+class DynamicGraphContextL2ATransformer(nn.Module):
+    def __init__(
+        self,
+        Nt: int = 32,
+        d_model: int = 128,
+        num_heads: int = 4,
+        d_ff: int = 256,
+        T: int = 8,
+        init_flip_prob: float = 0.5,
+    ):
+        super().__init__()
+        self.Nt = Nt
+        self.d_model = d_model
+        self.T = T
+        self.node_mlp = MLP(6, d_ff, d_model, layers=2)
+        self.pos_emb = nn.Embedding(Nt, d_model)
+        self.blocks = nn.ModuleList([EdgeBiasedTransformerBlock(d_model, num_heads, d_ff) for _ in range(T)])
+        self.ar_token_mlp = MLP(6 + d_model, d_ff, d_model, layers=2)
+        self.ar_gru = nn.GRUCell(d_model, d_model)
+        self.head_i = MLP(2 * d_model, d_ff, 2, layers=2)
+        self.head_q = MLP(2 * d_model, d_ff, 2, layers=2)
+        self.init_proposal_heads(init_flip_prob)
+
+    def init_proposal_heads(self, init_bit_prob: float) -> None:
+        """Initialize direct bit-value proposal heads."""
+        init_bit_prob = min(max(init_bit_prob, 1e-5), 1.0 - 1e-5)
+        init_bias = math.log(init_bit_prob / (1.0 - init_bit_prob))
+        for head in (self.head_i, self.head_q):
+            final_layer = head.net[-1] if isinstance(head.net, nn.Sequential) else head.net
+            if isinstance(final_layer, nn.Linear):
+                nn.init.normal_(final_layer.weight, mean=0.0, std=1e-3)
+                nn.init.constant_(final_layer.bias, init_bias)
+
+    def build_context(self, H: torch.Tensor, y: torch.Tensor, sigma2: float, K: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build initial node context and edge features.
+
+        Returns:
+            Z: (B, K, Nt, d_model)
+            edge_feat: (B, K, Nt, Nt, 4)
+        """
+        B, Nr, Nt = H.shape
+        Hh = H.conj().transpose(-1, -2)
+        R = torch.matmul(Hh, H)  # (B, Nt, Nt)
+        z = torch.matmul(Hh, y[..., None]).squeeze(-1)  # (B, Nt)
+        sigma_col = torch.full((B, Nt, 1), float(sigma2), device=H.device)
+        idx = torch.arange(Nt, device=H.device).float()[None, :, None].expand(B, Nt, 1) / max(Nt - 1, 1)
+        diag_R = R.diagonal(dim1=-2, dim2=-1).real.unsqueeze(-1)
+        node_feat = torch.cat([z.real.unsqueeze(-1), z.imag.unsqueeze(-1), z.abs().unsqueeze(-1), diag_R, sigma_col, idx], dim=-1).float()
+        pos = self.pos_emb(torch.arange(Nt, device=H.device))[None, :, :]
+        Z0 = self.node_mlp(node_feat) + pos
+        Z = Z0[:, None, :, :].expand(B, K, Nt, self.d_model).contiguous()
+
+        angle = torch.angle(R)
+        edge_feat = torch.stack([R.real, R.imag, R.abs(), angle], dim=-1).float()
+        edge_feat = edge_feat[:, None, :, :, :].expand(B, K, Nt, Nt, 4).contiguous()
+        return Z, edge_feat
+
+    def forward(
+        self,
+        H: torch.Tensor,
+        y: torch.Tensor,
+        sigma2: float,
+        init_bits: torch.Tensor,
+        sample: bool = True,
+        flip_floor: float = 0.0,
+        local_search_sweeps: int = 1,
+        local_search_multi_rounds: int = 2,
+        local_search_topk: int = 2,
+    ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
+        """
+        Args:
+            H: (B, Nr, Nt)
+            y: (B, Nr)
+            init_bits: (B, K, Nt, 4)
+        Returns:
+            raw_bits_per_layer: raw Transformer proposals, each (B, K, Nt, 4)
+            bits_per_layer: locally refined layer states, each (B, K, Nt, 4)
+            final_bits: final locally refined state, (B, K, Nt, 4)
+            logprob: (B, K), total raw-proposal trajectory log probability
+            entropy: (B, K), total direct bit-value Bernoulli entropy
+        """
+        B, K, Nt, _ = init_bits.shape
+        assert Nt == self.Nt
+        Z, edge_feat = self.build_context(H, y, sigma2, K=K)
+        bits_prev = init_bits.float()
+        logprob = torch.zeros(B, K, device=H.device)
+        entropy = torch.zeros(B, K, device=H.device)
+        raw_bits_per_layer: List[torch.Tensor] = []
+        bits_per_layer: List[torch.Tensor] = []
+
+        BK = B * K
+        edge_flat = edge_feat.view(BK, Nt, Nt, 4)
+
+        flip_floor = min(max(float(flip_floor), 0.0), 0.49)
+
+        for t, block in enumerate(self.blocks):
+            Z_flat = Z.view(BK, Nt, self.d_model)
+            Z_flat = block(Z_flat, edge_flat)
+            Z = Z_flat.view(B, K, Nt, self.d_model)
+
+            # Across-symbol autoregressive direct proposal. The heads sample
+            # new bit values, not residual flip masks around the previous state.
+            ar_state = torch.zeros(BK, self.d_model, device=H.device)
+            new_bits_list: List[torch.Tensor] = []
+
+            for i in range(Nt):
+                zi = Z_flat[:, i, :]
+                head_in = torch.cat([zi, ar_state], dim=-1)
+                bit_probs_i = torch.sigmoid(self.head_i(head_in)).clamp(1e-5, 1.0 - 1e-5)  # (BK, 2)
+                bit_probs_q = torch.sigmoid(self.head_q(head_in)).clamp(1e-5, 1.0 - 1e-5)  # (BK, 2)
+                if flip_floor > 0.0:
+                    bit_probs_i = flip_floor + (1.0 - 2.0 * flip_floor) * bit_probs_i
+                    bit_probs_q = flip_floor + (1.0 - 2.0 * flip_floor) * bit_probs_q
+                if sample:
+                    bit_i = torch.bernoulli(bit_probs_i)
+                    bit_q = torch.bernoulli(bit_probs_q)
+                else:
+                    bit_i = (bit_probs_i >= 0.5).float()
+                    bit_q = (bit_probs_q >= 0.5).float()
+                bi = torch.cat([bit_i, bit_q], dim=-1)
+                lp_i = bit_i * torch.log(bit_probs_i) + (1.0 - bit_i) * torch.log(1.0 - bit_probs_i)
+                lp_q = bit_q * torch.log(bit_probs_q) + (1.0 - bit_q) * torch.log(1.0 - bit_probs_q)
+                ent_i = -(bit_probs_i * torch.log(bit_probs_i) + (1.0 - bit_probs_i) * torch.log(1.0 - bit_probs_i))
+                ent_q = -(bit_probs_q * torch.log(bit_probs_q) + (1.0 - bit_probs_q) * torch.log(1.0 - bit_probs_q))
+                lp = torch.cat([lp_i, lp_q], dim=-1)
+                ent = torch.cat([ent_i, ent_q], dim=-1)
+                logprob = logprob + lp.sum(dim=-1).view(B, K)
+                entropy = entropy + ent.sum(dim=-1).view(B, K)
+                new_bits_list.append(bi.view(B, K, 1, 4))
+
+                # Update AR state using the newly generated valid 16-QAM symbol bits.
+                bi_bk = bi.view(BK, 1, 4)
+                xi = bits_to_qam(bi_bk).view(BK)
+                pos_i = Z_flat[:, i, :]
+                ar_feat = torch.cat([bi, xi.real.unsqueeze(-1), xi.imag.unsqueeze(-1), pos_i], dim=-1)
+                ar_token = self.ar_token_mlp(ar_feat)
+                ar_state = self.ar_gru(ar_token, ar_state)
+
+            bits_curr = torch.cat(new_bits_list, dim=2)  # (B, K, Nt, 4)
+            refined_bits = local_search_refine_bits(
+                bits_curr,
+                H,
+                y,
+                sigma2,
+                sweeps=local_search_sweeps,
+                multi_rounds=local_search_multi_rounds,
+                topk_symbols=local_search_topk,
+            )
+            raw_bits_per_layer.append(bits_curr)
+            bits_per_layer.append(refined_bits)
+            bits_prev = refined_bits
+
+        return {
+            "raw_bits_per_layer": raw_bits_per_layer,
+            "bits_per_layer": bits_per_layer,
+            "final_bits": bits_prev,
+            "logprob": logprob,
+            "entropy": entropy,
+        }
+
+
+# -----------------------------
+# Training and evaluation
+# -----------------------------
+
+
+def entropy_lambda(step: int, total_steps: int, lam_max: float, lam_min: float) -> float:
+    if total_steps <= 1:
+        return lam_min
+    frac = min(max(step / float(total_steps - 1), 0.0), 1.0)
+    return lam_max * ((lam_min / lam_max) ** frac)
+
+
+def anneal_value(step: int, total_steps: int, value_max: float, value_min: float) -> float:
+    if total_steps <= 1:
+        return value_min
+    frac = min(max(step / float(total_steps - 1), 0.0), 1.0)
+    if value_max <= 0.0 or value_min <= 0.0:
+        return value_max + frac * (value_min - value_max)
+    return value_max * ((value_min / value_max) ** frac)
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: DynamicGraphContextL2ATransformer,
+    cfg: MIMOConfig,
+    batch_size: int,
+    batches: int,
+    K_test: int,
+    perturb_p: float,
+    strong_perturb_p: float,
+    flip_floor: float,
+    local_search_sweeps: int,
+    local_search_multi_rounds: int,
+    local_search_topk: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    model.eval()
+    total_bits = 0
+    total_bit_errors = 0
+    total_energy = 0.0
+    zf_errors = 0
+    lmmse_errors = 0
+    for _ in range(batches):
+        H, y, true_bits, _ = generate_batch(batch_size, cfg, device)
+        init_bits = initialize_simulators(H, y, cfg.sigma2, K=K_test, p_symbol=perturb_p, strong_p_symbol=strong_perturb_p)
+        out = model(
+            H,
+            y,
+            cfg.sigma2,
+            init_bits,
+            sample=True,
+            flip_floor=flip_floor,
+            local_search_sweeps=local_search_sweeps,
+            local_search_multi_rounds=local_search_multi_rounds,
+            local_search_topk=local_search_topk,
+        )
+        cand = out["final_bits"]  # (B, K, Nt, 4)
+        energy = residual_energy(cand, H, y, cfg.sigma2)  # (B, K)
+        best_idx = energy.argmin(dim=1)
+        best_bits = cand[torch.arange(batch_size, device=device), best_idx]
+        total_bit_errors += (best_bits.round().long() != true_bits.round().long()).sum().item()
+        total_bits += true_bits.numel()
+        total_energy += energy[torch.arange(batch_size, device=device), best_idx].sum().item()
+
+        zf_bits = linear_detector_bits(H, y, cfg.sigma2, kind="zf")
+        lmmse_bits = linear_detector_bits(H, y, cfg.sigma2, kind="lmmse")
+        zf_errors += (zf_bits.round().long() != true_bits.round().long()).sum().item()
+        lmmse_errors += (lmmse_bits.round().long() != true_bits.round().long()).sum().item()
+
+    return {
+        "ber": total_bit_errors / total_bits,
+        "residual_energy": total_energy / (batch_size * batches),
+        "zf_ber": zf_errors / total_bits,
+        "lmmse_ber": lmmse_errors / total_bits,
+    }
+
+
+@torch.no_grad()
+def evaluate_fixed_test_set(
+    model: DynamicGraphContextL2ATransformer,
+    H: torch.Tensor,
+    y: torch.Tensor,
+    true_bits: torch.Tensor,
+    init_bits: torch.Tensor,
+    sigma2: float,
+    flip_floor: float,
+    local_search_sweeps: int,
+    local_search_multi_rounds: int,
+    local_search_topk: int,
+) -> Dict[str, float]:
+    model.eval()
+    B = H.shape[0]
+    out = model(
+        H,
+        y,
+        sigma2,
+        init_bits,
+        sample=True,
+        flip_floor=flip_floor,
+        local_search_sweeps=local_search_sweeps,
+        local_search_multi_rounds=local_search_multi_rounds,
+        local_search_topk=local_search_topk,
+    )
+    cand = out["final_bits"]
+    energy = residual_energy(cand, H, y, sigma2)
+    best_idx = energy.argmin(dim=1)
+    best_bits = cand[torch.arange(B, device=H.device), best_idx]
+    bit_errors = (best_bits.round().long() != true_bits.round().long()).sum().item()
+    total_energy = energy[torch.arange(B, device=H.device), best_idx].sum().item()
+    return {
+        "ber": bit_errors / true_bits.numel(),
+        "residual_energy": total_energy / B,
+    }
+
+
+def train(args: argparse.Namespace) -> None:
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    set_seed(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    cfg = MIMOConfig(Nt=32, Nr=32, snr_db=args.snr_db)
+    fixed_test_H, fixed_test_y, fixed_test_bits, _ = generate_batch(args.fixed_test_size, cfg, device)
+    fixed_test_init_bits = initialize_simulators(
+        fixed_test_H,
+        fixed_test_y,
+        cfg.sigma2,
+        K=args.K_test,
+        p_symbol=args.perturb_p,
+        strong_p_symbol=args.strong_perturb_p,
+    )
+
+    model = DynamicGraphContextL2ATransformer(
+        Nt=cfg.Nt,
+        d_model=args.d_model,
+        num_heads=args.heads,
+        d_ff=args.d_ff,
+        T=args.layers,
+        init_flip_prob=args.init_flip_prob,
+    ).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: total={total_params:,} trainable={trainable_params:,}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    metrics_path = os.path.join(args.out_dir, "training_metrics.csv")
+    ckpt_path = os.path.join(args.out_dir, "mimo_l2a_transformer.pt")
+    resume_path = args.resume_path or ckpt_path
+    start_step = 1
+    ml_benchmark: Dict[str, float] | None = None
+    if args.resume:
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Cannot resume because checkpoint does not exist: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state"])
+        if "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if "fixed_test" in checkpoint:
+            fixed_test = checkpoint["fixed_test"]
+            fixed_test_H = fixed_test["H"]
+            fixed_test_y = fixed_test["y"]
+            fixed_test_bits = fixed_test["true_bits"]
+            fixed_test_init_bits = fixed_test["init_bits"]
+        if "ml_benchmark" in checkpoint:
+            ml_benchmark = checkpoint["ml_benchmark"]
+        start_step = int(checkpoint.get("step", 0)) + 1
+        print(f"Resumed checkpoint: {resume_path} at step={start_step - 1}")
+
+    requested_ml_test_size = 0 if args.ml_mode == "off" else max(0, int(args.ml_test_size))
+    ml_test_size = min(requested_ml_test_size, int(fixed_test_H.shape[0]))
+    effective_ml_mode = args.ml_mode
+    if effective_ml_mode == "auto":
+        effective_ml_mode = "exact" if cfg.Nt <= args.ml_exact_max_nt else "kbest"
+    if effective_ml_mode == "exact" and cfg.Nt > args.ml_exact_max_nt:
+        print(
+            f"Exact ML benchmark requested for Nt={cfg.Nt}, but exact sphere decoding is impractical; "
+            "switching to K-best surrogate."
+        )
+        effective_ml_mode = "kbest"
+    if ml_test_size == 0:
+        ml_benchmark = {
+            "ber": float("nan"),
+            "residual_energy": float("nan"),
+            "num_instances": 0.0,
+            "mode": "off",
+        }
+        print("ML reference benchmark disabled (ml_test_size=0 or ml_mode=off).")
+    elif (
+        ml_benchmark is None
+        or int(ml_benchmark.get("num_instances", -1)) != ml_test_size
+        or str(ml_benchmark.get("mode", "")) != effective_ml_mode
+    ):
+        ml_eval = evaluate_ml_reference(
+            fixed_test_H[:ml_test_size],
+            fixed_test_y[:ml_test_size],
+            fixed_test_bits[:ml_test_size],
+            cfg.sigma2,
+            mode=effective_ml_mode,
+            beam_width=args.ml_kbest_width,
+        )
+        ml_benchmark = {
+            "ber": ml_eval["ber"],
+            "residual_energy": ml_eval["residual_energy"],
+            "num_instances": float(ml_test_size),
+            "mode": ml_eval["mode"],
+        }
+        print(
+            f"ML reference benchmark mode={ml_benchmark['mode']} "
+            f"({ml_test_size} fixed test samples): BER={ml_benchmark['ber']:.4e}"
+        )
+
+    metrics_fieldnames = [
+        "step",
+        "lambda_entropy",
+        "flip_floor",
+        "train_loss",
+        "train_energy",
+        "train_raw_energy",
+        "train_refined_energy",
+        "train_ls_improvement",
+        "val_ber",
+        "val_residual_energy",
+        "fixed_test_ber",
+        "fixed_test_residual_energy",
+        "zf_ber",
+        "lmmse_ber",
+        "ml_ber",
+        "ml_residual_energy",
+    ]
+    write_metrics_header = not (args.resume and os.path.exists(metrics_path))
+    with open(metrics_path, "a" if args.resume else "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=metrics_fieldnames,
+        )
+        if write_metrics_header:
+            writer.writeheader()
+
+    history: List[Dict[str, float]] = []
+    printed_baselines = False
+
+    for step in range(start_step, args.steps + 1):
+        model.train()
+        H, y, true_bits, _ = generate_batch(args.batch_size, cfg, device)
+        init_bits = initialize_simulators(H, y, cfg.sigma2, K=args.K_train, p_symbol=args.perturb_p, strong_p_symbol=args.strong_perturb_p)
+        flip_floor = anneal_value(step - 1, args.steps, args.flip_floor_max, args.flip_floor_min)
+        out = model(
+            H,
+            y,
+            cfg.sigma2,
+            init_bits,
+            sample=True,
+            flip_floor=flip_floor,
+            local_search_sweeps=args.local_search_sweeps,
+            local_search_multi_rounds=args.local_search_multi_rounds,
+            local_search_topk=args.local_search_topk,
+        )
+        raw_bits_per_layer: List[torch.Tensor] = out["raw_bits_per_layer"]  # list of raw Transformer proposals, (B,K,Nt,4)
+        bits_per_layer: List[torch.Tensor] = out["bits_per_layer"]  # list of (B,K,Nt,4)
+        logprob: torch.Tensor = out["logprob"]
+        entropy: torch.Tensor = out["entropy"]
+
+        # Advantage uses the locally refined trajectory energy. The policy score
+        # still comes from the raw Transformer samples through logprob.
+        layer_energies = torch.stack([residual_energy(bits_t, H, y, cfg.sigma2) for bits_t in bits_per_layer], dim=0)
+        energy_return = layer_energies.mean(dim=0)  # uniform omega_t over refined layers, (B, K)
+        final_energy = layer_energies[-1]
+        raw_final_energy = residual_energy(raw_bits_per_layer[-1], H, y, cfg.sigma2)
+
+        # Within-instance standardized advantage. This reduces both channel-instance
+        # difficulty variance and per-instance energy scale variance.
+        advantage = energy_return - energy_return.mean(dim=1, keepdim=True)
+        advantage = advantage / (energy_return.std(dim=1, keepdim=True, unbiased=False) + 1e-6)
+        advantage = advantage.detach()
+        lam = entropy_lambda(step - 1, args.steps, args.lambda_max, args.lambda_min)
+
+        # Policy-gradient surrogate for minimizing energy with entropy regularization.
+        pg_loss = (advantage * logprob).mean()
+        entropy_loss = -lam * entropy.mean()
+        loss = pg_loss + entropy_loss
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+
+        if step % args.log_every == 0 or step == 1:
+            val = evaluate_model(
+                model,
+                cfg,
+                batch_size=args.val_batch_size,
+                batches=args.val_batches,
+                K_test=args.K_test,
+                perturb_p=args.perturb_p,
+                strong_perturb_p=args.strong_perturb_p,
+                flip_floor=flip_floor,
+                local_search_sweeps=args.local_search_sweeps,
+                local_search_multi_rounds=args.local_search_multi_rounds,
+                local_search_topk=args.local_search_topk,
+                device=device,
+            )
+            fixed_test = evaluate_fixed_test_set(
+                model,
+                fixed_test_H,
+                fixed_test_y,
+                fixed_test_bits,
+                fixed_test_init_bits,
+                cfg.sigma2,
+                flip_floor=flip_floor,
+                local_search_sweeps=args.local_search_sweeps,
+                local_search_multi_rounds=args.local_search_multi_rounds,
+                local_search_topk=args.local_search_topk,
+            )
+            row = {
+                "step": step,
+                "lambda_entropy": lam,
+                "flip_floor": flip_floor,
+                "train_loss": loss.item(),
+                "train_energy": final_energy.mean().item(),
+                "train_raw_energy": raw_final_energy.mean().item(),
+                "train_refined_energy": final_energy.mean().item(),
+                "train_ls_improvement": (raw_final_energy - final_energy).mean().item(),
+                "val_ber": val["ber"],
+                "val_residual_energy": val["residual_energy"],
+                "fixed_test_ber": fixed_test["ber"],
+                "fixed_test_residual_energy": fixed_test["residual_energy"],
+                "zf_ber": val["zf_ber"],
+                "lmmse_ber": val["lmmse_ber"],
+                "ml_ber": ml_benchmark["ber"],
+                "ml_residual_energy": ml_benchmark["residual_energy"],
+            }
+            history.append(row)
+            with open(metrics_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=metrics_fieldnames)
+                writer.writerow(row)
+            print(
+                f"step={step:05d} "
+                f"train_raw={row['train_raw_energy']:.4f} train_refined={row['train_refined_energy']:.4f} "
+                f"ls_gain={row['train_ls_improvement']:.4f} "
+                f"val_BER={row['val_ber']:.4e} fixed_test_BER={row['fixed_test_ber']:.4e}"
+            )
+            if not printed_baselines:
+                baseline_msg = f"baselines: ZF_BER={row['zf_ber']:.4e} LMMSE_BER={row['lmmse_ber']:.4e}"
+                if ml_test_size > 0:
+                    baseline_msg += f" MLref({ml_benchmark['mode']})_BER={row['ml_ber']:.4e} (fixed subset n={ml_test_size})"
+                print(baseline_msg)
+                printed_baselines = True
+            make_plots(metrics_path, args.out_dir)
+
+        if step % args.save_every == 0:
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "args": vars(args),
+                    "step": step,
+                    "ml_benchmark": ml_benchmark,
+                    "fixed_test": {
+                        "H": fixed_test_H,
+                        "y": fixed_test_y,
+                        "true_bits": fixed_test_bits,
+                        "init_bits": fixed_test_init_bits,
+                    },
+                },
+                ckpt_path,
+            )
+            print(f"checkpoint saved: {ckpt_path} at step={step}")
+
+    # Save checkpoint and plots.
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "args": vars(args),
+            "step": args.steps,
+            "ml_benchmark": ml_benchmark,
+            "fixed_test": {
+                "H": fixed_test_H,
+                "y": fixed_test_y,
+                "true_bits": fixed_test_bits,
+                "init_bits": fixed_test_init_bits,
+            },
+        },
+        ckpt_path,
+    )
+    make_plots(metrics_path, args.out_dir)
+
+
+def make_plots(metrics_path: str, out_dir: str) -> None:
+    rows = []
+    with open(metrics_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append({k: float(v) for k, v in row.items()})
+    if not rows:
+        return
+    steps = [r["step"] for r in rows]
+
+    def series(name: str) -> List[float] | None:
+        if name not in rows[0]:
+            return None
+        return [r[name] for r in rows]
+
+    plt.figure()
+    for key, label in [
+        ("val_ber", "Validation"),
+        ("fixed_test_ber", "Fixed test"),
+        ("zf_ber", "ZF"),
+        ("lmmse_ber", "LMMSE"),
+        ("ml_ber", "Exact ML (fixed subset)"),
+    ]:
+        values = series(key)
+        if values is not None:
+            plt.semilogy(steps, values, label=label)
+    plt.xlabel("Training step")
+    plt.ylabel("BER")
+    plt.title("BER convergence")
+    plt.grid(True, which="both")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ber_convergence.png"), dpi=200)
+    plt.close()
+
+    plt.figure()
+    energy_curves = [
+        ("train_raw_energy", "Train raw final"),
+        ("train_refined_energy", "Train refined final"),
+    ]
+    if "train_refined_energy" not in rows[0]:
+        energy_curves.append(("train_energy", "Train"))
+    energy_curves += [
+        ("val_residual_energy", "Validation refined"),
+        ("fixed_test_residual_energy", "Fixed test refined"),
+        ("ml_residual_energy", "Exact ML (fixed subset)"),
+    ]
+    for key, label in energy_curves:
+        values = series(key)
+        if values is not None:
+            plt.plot(steps, values, label=label)
+    plt.xlabel("Training step")
+    plt.ylabel("Normalized residual energy")
+    plt.title("Residual energy convergence")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "residual_energy_convergence.png"), dpi=200)
+    plt.close()
+
+    ls_improvement = series("train_ls_improvement")
+    if ls_improvement is not None:
+        plt.figure()
+        plt.plot(steps, ls_improvement, label="Train raw-refined")
+        plt.xlabel("Training step")
+        plt.ylabel("Normalized residual energy decrease")
+        plt.title("Local-search energy improvement")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "local_search_improvement.png"), dpi=200)
+        plt.close()
+
+    train_loss = series("train_loss")
+    if train_loss is not None:
+        plt.figure()
+        plt.plot(steps, train_loss, label="Train loss")
+        plt.xlabel("Training step")
+        plt.ylabel("Loss")
+        plt.title("Training loss convergence")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "training_loss_convergence.png"), dpi=200)
+        plt.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Dynamic graph-context L2A Transformer for hard 32x32 16-QAM MIMO detection.")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--out-dir", type=str, default="mimo_l2a_results")
+    parser.add_argument("--snr-db", type=float, default=15.0)
+    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--val-batch-size", type=int, default=512)
+    parser.add_argument("--val-batches", type=int, default=4)
+    parser.add_argument("--fixed-test-size", type=int, default=128, help="Number of fixed on-the-fly test samples generated once at training start.")
+    parser.add_argument("--ml-test-size", type=int, default=32, help="Number of fixed test samples used for ML reference BER.")
+    parser.add_argument("--ml-mode", type=str, default="auto", choices=["auto", "exact", "kbest", "off"], help="ML reference mode: exact sphere decoding for small systems, K-best surrogate for large systems, or off.")
+    parser.add_argument("--ml-exact-max-nt", type=int, default=8, help="Maximum Nt for exact sphere-decoder benchmark when --ml-mode=auto.")
+    parser.add_argument("--ml-kbest-width", type=int, default=256, help="Beam width for K-best ML surrogate when exact ML is too expensive.")
+    parser.add_argument("--log-every", type=int, default=5)
+    parser.add_argument("--save-every", type=int, default=5000)
+    parser.add_argument("--resume", action="store_true", help="Resume training from a checkpoint and append to the metrics CSV.")
+    parser.add_argument("--resume-path", type=str, default="", help="Checkpoint path to resume from. Defaults to <out-dir>/mimo_l2a_transformer.pt.")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--layers", type=int, default=8)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--d-ff", type=int, default=256)
+    parser.add_argument("--init-flip-prob", type=float, default=0.5, help="Initial Bernoulli probability for direct bit-value proposals; kept under the old flag name for checkpoint/script compatibility.")
+    parser.add_argument("--flip-floor-max", type=float, default=0.05, help="Initial lower bound for direct bit-value proposal probabilities.")
+    parser.add_argument("--flip-floor-min", type=float, default=0.005, help="Final lower bound for direct bit-value proposal probabilities.")
+    parser.add_argument("--K-train", type=int, default=32)
+    parser.add_argument("--K-test", type=int, default=32)
+    parser.add_argument("--perturb-p", type=float, default=0.25, help="Ignored in the fully random initialization variant; kept for CLI compatibility.")
+    parser.add_argument("--strong-perturb-p", type=float, default=0.6, help="Ignored in the fully random initialization variant; kept for CLI compatibility.")
+    parser.add_argument("--local-search-multi-rounds", type=int, default=2, help="Number of coarse top-k simultaneous Gray-neighbor perturbation rounds after every Transformer layer.")
+    parser.add_argument("--local-search-topk", type=int, default=2, help="Number of QAM symbols changed jointly in each coarse local-search round.")
+    parser.add_argument("--local-search-sweeps", type=int, default=1, help="Number of fine sequential best-one-hop Gray-neighbor sweeps applied after every Transformer layer; set 0 to disable.")
+    parser.add_argument("--lambda-max", type=float, default=0.03)
+    parser.add_argument("--lambda-min", type=float, default=0.001)
+    args = parser.parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
