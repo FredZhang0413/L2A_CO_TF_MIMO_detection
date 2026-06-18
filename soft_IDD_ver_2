@@ -1,0 +1,1953 @@
+#!/usr/bin/env python3
+"""
+Soft-decision IDD MIMO detection for 8x8 256-QAM, warm-startable from the hard-decision
+L2A Transformer (mimo_l2a_toy_5_20_2.py) and extended to a coded 5G-LDPC system.
+
+Design (see "Soft-IDD MIMO Detection — Design Mapped onto the Hard-Decision L2A Code"):
+  * Front end: 5G LDPC encoder + bit interleaver produce *coded* bits; coded bits are
+    mapped to 256-QAM and sent through y = H x + n. (Fixed routine, outside learning.)
+  * Detector: an across-symbol autoregressive Transformer with per-bit sigmoid heads,
+    identical in spirit to the hard-decision model. It outputs a per-bit logit L_net.
+  * Prior tilt (Route C): the decoder's a-priori LLR L^A is applied only at the
+    Bernoulli sampling head. With this file's convention L^A = log p(b=0)/p(b=1)
+    and the neural head logit = logit P(b=1), the tilted sampling logit is
+    L_tilt = L_net - L^A. The prior reshapes the *sampling* distribution; the
+    network parameters never take L^A as input.
+  * Soft output: posterior LLR is estimated (Rao-Blackwellized) from the tilted samples;
+    the extrinsic LLR L_E = L_post - L^A is returned to the decoder (prevents the bit's
+    own prior from being double counted).
+  * Back end: a fixed (never-trained) Sionna LDPC5GDecoder closes the IDD loop via
+    extrinsic exchange. (Fixed routine, outside learning.)
+
+Phase-1 training (this file): the a-priori LLR source is configurable. The original
+efficient option synthesizes LLRs from the classical consistent-Gaussian model
+    L^A ~ N( (-1)^b * sigma_A^2/2 , sigma_A^2 ),  sigma_A = J^{-1}(I_A),  I_A in [0,1],
+which is the ten-Brink EXIT-chart assumption and the same recipe used by DNN-TEQ.
+The default compromise is a one-pass detector->decoder prior: run the current detector
+once with L^A=0, feed its extrinsic LLRs through the fixed LDPC decoder, and use the
+decoder extrinsic as the context-aware prior for a second detector pass. One *tied*
+operator is still reused at every IDD iteration.
+Loss = switchable: pure population BCE on coded bits, or a residual-to-hybrid
+residual/BCE curriculum using policy-gradient credit for the non-differentiable
+sampled residual energy.
+Final metric = coded-bit BER (and post-LDPC coded/info BER for reporting).
+
+A faithful on-policy IDD fine-tuning phase (untied per-iteration networks) is deferred.
+
+The Sionna pieces are optional and isolated: if Sionna is unavailable, the script falls
+back to an uncoded data source and a placeholder decoder so the detector and Phase-1
+training still run as a smoke test. All comments are in English.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# =============================================================================
+# Optional Sionna 5G LDPC integration (native PyTorch as of Sionna PHY 2.0).
+# Isolated here so the rest of the code is agnostic to whether Sionna is present.
+# =============================================================================
+
+SIONNA_AVAILABLE = False
+try:
+    from sionna.phy.fec.ldpc import LDPC5GEncoder, LDPC5GDecoder  # type: ignore
+    from sionna.phy.fec.interleaving import RandomInterleaver, Deinterleaver  # type: ignore
+
+    SIONNA_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    LDPC5GEncoder = None  # type: ignore
+    LDPC5GDecoder = None  # type: ignore
+    RandomInterleaver = None  # type: ignore
+    Deinterleaver = None  # type: ignore
+
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def complex_normal(shape, device, dtype=torch.complex64, scale: float = 1.0) -> torch.Tensor:
+    """Generate circular complex Gaussian samples CN(0, scale^2)."""
+    real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+    x = torch.randn(*shape, device=device, dtype=real_dtype)
+    y = torch.randn(*shape, device=device, dtype=real_dtype)
+    return (scale / math.sqrt(2.0)) * (x + 1j * y)
+
+
+# -----------------------------
+# 256-QAM Gray mapping (identical convention to the hard-decision code)
+# -----------------------------
+
+AXIS_BITS = 4
+BITS_PER_SYMBOL = 2 * AXIS_BITS  # 8 bits per 256-QAM symbol
+QAM_ORDER = 1 << BITS_PER_SYMBOL
+LEVELS = torch.tensor(
+    [-15.0, -13.0, -11.0, -9.0, -7.0, -5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0]
+)
+GRAY_AXIS_LABELS = torch.tensor(
+    [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ]
+)
+QAM_NORM = math.sqrt(170.0)  # average symbol energy normalization for 256-QAM
+
+
+def bits_to_level(bits_axis: torch.Tensor) -> torch.Tensor:
+    """Map Gray-coded axis bits (..., 4) to 16-PAM levels."""
+    labels = GRAY_AXIS_LABELS.to(bits_axis.device, dtype=bits_axis.dtype)
+    matches = (bits_axis.float()[..., None, :] == labels).all(dim=-1)
+    idx = matches.float().argmax(dim=-1)
+    return LEVELS.to(bits_axis.device)[idx]
+
+
+def level_to_bits(levels: torch.Tensor) -> torch.Tensor:
+    """Map nearest 16-PAM levels to Gray-coded four-bit labels."""
+    levels_device = LEVELS.to(levels.device)
+    dist = (levels[..., None] - levels_device) ** 2
+    idx = dist.argmin(dim=-1)
+    return GRAY_AXIS_LABELS.to(levels.device)[idx]
+
+
+def bits_to_qam(bits: torch.Tensor) -> torch.Tensor:
+    """Map bits (..., Nt, 8) to normalized 256-QAM symbols (..., Nt)."""
+    real_level = bits_to_level(bits[..., 0:AXIS_BITS])
+    imag_level = bits_to_level(bits[..., AXIS_BITS:BITS_PER_SYMBOL])
+    return (real_level + 1j * imag_level).to(torch.complex64) / QAM_NORM
+
+
+def qam_to_bits(x: torch.Tensor) -> torch.Tensor:
+    """Hard-slice complex symbols to normalized 256-QAM and return bits (..., Nt, 8)."""
+    xr = (x.real * QAM_NORM).clamp(float(LEVELS[0].item()), float(LEVELS[-1].item()))
+    xi = (x.imag * QAM_NORM).clamp(float(LEVELS[0].item()), float(LEVELS[-1].item()))
+    br = level_to_bits(xr)
+    bi = level_to_bits(xi)
+    return torch.cat([br, bi], dim=-1)
+
+
+def qam_constellation(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return all 256 valid Gray-labeled 256-QAM bit labels and symbols."""
+    axis_labels = GRAY_AXIS_LABELS.to(device)
+    bits = torch.cat(
+        [
+            axis_labels[:, None, :].expand(-1, axis_labels.shape[0], -1),
+            axis_labels[None, :, :].expand(axis_labels.shape[0], -1, -1),
+        ],
+        dim=-1,
+    ).reshape(-1, BITS_PER_SYMBOL)
+    symbols = bits_to_qam(bits.view(-1, 1, BITS_PER_SYMBOL)).view(-1)
+    return bits, symbols
+
+
+def residual_energy(bits: torch.Tensor, H: torch.Tensor, y: torch.Tensor, sigma2: float) -> torch.Tensor:
+    """Normalized residual energy ||y - H M(b)||^2 / (Nr sigma^2).
+
+    bits: (B, K, Nt, 8) or (B, Nt, 8); H: (B, Nr, Nt); y: (B, Nr). Returns (B, K) or (B,).
+    """
+    if bits.dim() == 4:
+        x = bits_to_qam(bits)  # (B, K, Nt)
+        H_expand = H[:, None, :, :]
+        pred = torch.matmul(H_expand, x[..., None]).squeeze(-1)
+        err = y[:, None, :] - pred
+        Nr = H.shape[1]
+        return (err.abs() ** 2).sum(dim=-1).real / (Nr * sigma2)
+    elif bits.dim() == 3:
+        x = bits_to_qam(bits)
+        pred = torch.matmul(H, x[..., None]).squeeze(-1)
+        err = y - pred
+        Nr = H.shape[1]
+        return (err.abs() ** 2).sum(dim=-1).real / (Nr * sigma2)
+    raise ValueError(f"Unsupported bits dimension: {bits.shape}")
+
+
+def bit_error_rate(pred_bits: torch.Tensor, true_bits: torch.Tensor) -> float:
+    return (pred_bits.round().long() != true_bits.round().long()).float().mean().item()
+
+
+# -----------------------------
+# Consistent-Gaussian a-priori LLR model (ten Brink) and the J-function
+# -----------------------------
+
+
+def j_function(sigma: torch.Tensor) -> torch.Tensor:
+    """ten Brink's J(sigma): mutual information of a consistent-Gaussian LLR with std sigma.
+
+    Uses the standard closed-form approximation (Brannstrom/ten Brink). Input sigma >= 0,
+    output in [0, 1).
+    """
+    H1, H2, H3 = 0.3073, 0.8935, 1.1064
+    sigma = sigma.clamp_min(1e-6)
+    return (1.0 - torch.exp(-H1 * sigma.pow(2.0 * H2))).pow(H3)
+
+
+def inv_j_function(target_i: torch.Tensor, iters: int = 30) -> torch.Tensor:
+    """Numerical inverse J^{-1}(I): the consistent-Gaussian std for a-priori MI target_i.
+
+    Monotonic in sigma, so a simple bisection is robust and fully vectorized.
+    """
+    target_i = target_i.clamp(1e-4, 1.0 - 1e-4)
+    lo = torch.full_like(target_i, 1e-3)
+    hi = torch.full_like(target_i, 20.0)
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        i_mid = j_function(mid)
+        too_small = i_mid < target_i
+        lo = torch.where(too_small, mid, lo)
+        hi = torch.where(too_small, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def sample_apriori_llr(
+    coded_bits: torch.Tensor,
+    i_a: torch.Tensor,
+    llr_clip: float = 20.0,
+) -> torch.Tensor:
+    """Synthesize a-priori LLRs under the consistent-Gaussian (ten Brink) model.
+
+    For each bit b in {0,1}, with s = (1 - 2b) in {+1,-1} (the BPSK sign of the bit),
+        L^A = mu * s + sigma * noise,   mu = sigma^2 / 2,   sigma = J^{-1}(I_A).
+    The mean points (on average) toward the true bit, and the strength grows with I_A.
+    I_A = 0  =>  sigma -> 0  =>  L^A -> 0 (completely unknown prior).
+
+    coded_bits: (..., ) float tensor of {0,1}. i_a: broadcastable to coded_bits' shape.
+    Returns LLRs of the same shape as coded_bits, clipped to +-llr_clip.
+    """
+    sign = 1.0 - 2.0 * coded_bits.float()  # b=0 -> +1, b=1 -> -1
+    sigma = inv_j_function(i_a)
+    mu = sigma.pow(2) / 2.0
+    noise = torch.randn_like(coded_bits.float())
+    llr = mu * sign + sigma * noise
+    return llr.clamp(-llr_clip, llr_clip)
+
+
+# -----------------------------
+# Channel / system configuration
+# -----------------------------
+
+
+@dataclass
+class MIMOConfig:
+    Nt: int = 8
+    Nr: int = 8
+    snr_db: float = 20.0
+
+    @property
+    def sigma2(self) -> float:
+        return 10.0 ** (-self.snr_db / 10.0)
+
+
+def make_channel(batch_size: int, cfg: MIMOConfig, device: torch.device) -> torch.Tensor:
+    """i.i.d. Rayleigh channel H ~ CN(0, 1/Nt)."""
+    return complex_normal((batch_size, cfg.Nr, cfg.Nt), device=device, scale=1.0 / math.sqrt(cfg.Nt))
+
+
+def transmit(H: torch.Tensor, coded_bits: torch.Tensor, cfg: MIMOConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map coded bits (B, Nt, 8) to 256-QAM and pass through the channel: y = Hx + n."""
+    x = bits_to_qam(coded_bits)  # (B, Nt)
+    noise = complex_normal((H.shape[0], H.shape[1]), device=H.device, scale=math.sqrt(cfg.sigma2))
+    y = torch.matmul(H, x[..., None]).squeeze(-1) + noise
+    return y, x
+
+
+# =============================================================================
+# Coded-system harness: 5G LDPC encode + interleave (front) and LDPC decode (back).
+# The detector consumes/produces a per-(symbol,bit) grid of shape (B, Nt, 8); the
+# coded bitstream has length n_code = Nt * 8 coded bits per MIMO vector (one codeword
+# per MIMO vector, for the toy). We choose n_code accordingly and pick a 5G LDPC (k,n).
+# =============================================================================
+
+
+class CodedSystem:
+    """Wraps the 5G LDPC encoder/interleaver/decoder.
+
+    The toy maps exactly one LDPC codeword onto one MIMO vector:
+        n_code = Nt * BITS_PER_SYMBOL coded bits, k_info = round(coderate * n_code).
+    Encoder/interleaver/decoder are FIXED routines (no learnable parameters and, in
+    Phase-1, never differentiated through).
+
+    If Sionna is unavailable, this degrades to an "uncoded" harness: info bits == coded
+    bits and the decoder is a no-op that returns hard-sliced LLRs, so the detector and
+    Phase-1 training still run as a smoke test.
+    """
+
+    def __init__(self, cfg: MIMOConfig, coderate: float, num_bp_iter: int, device: torch.device,
+                 cn_update: str = "minsum"):
+        self.cfg = cfg
+        self.device = device
+        self.n_code = cfg.Nt * BITS_PER_SYMBOL
+        self.k_info = max(1, int(round(coderate * self.n_code)))
+        self.num_bp_iter = num_bp_iter
+        self.coderate = coderate
+        self.cn_update = cn_update
+        self.sionna = SIONNA_AVAILABLE
+
+        if self.sionna:
+            # Native-PyTorch Sionna PHY (>= 2.0). Encoder/decoder live on the same device.
+            self.encoder = LDPC5GEncoder(self.k_info, self.n_code)
+            # hard_out=False -> soft LLR output; return_infobits=False -> return all n
+            # coded-bit LLRs so we can recover the coded-bit extrinsic for the IDD loop.
+            self.decoder = LDPC5GDecoder(
+                self.encoder,
+                num_iter=num_bp_iter,
+                hard_out=False,
+                return_infobits=False,
+                cn_update=cn_update,
+            )
+            self.decoder_info = LDPC5GDecoder(
+                self.encoder,
+                num_iter=num_bp_iter,
+                hard_out=True,
+                return_infobits=True,
+                cn_update=cn_update,
+            )
+            # Fixed pseudo-random bit interleaver between coded bits and the mapper.
+            self.interleaver = RandomInterleaver()
+            self.deinterleaver = Deinterleaver(self.interleaver)
+
+    # ---- helpers to move between (B, Nt, 8) bit grids and (B, n_code) bitstreams ----
+
+    def grid_to_stream(self, grid: torch.Tensor) -> torch.Tensor:
+        """(B, Nt, 8) -> (B, Nt*8)."""
+        B = grid.shape[0]
+        return grid.reshape(B, self.n_code)
+
+    def stream_to_grid(self, stream: torch.Tensor) -> torch.Tensor:
+        """(B, Nt*8) -> (B, Nt, 8)."""
+        B = stream.shape[0]
+        return stream.reshape(B, self.cfg.Nt, BITS_PER_SYMBOL)
+
+    # ---- front end: info bits -> coded bits -> interleaved -> (B, Nt, 8) grid ----
+
+    def generate_coded_grid(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (info_bits (B,k), coded_grid (B,Nt,8)).
+
+        Random info bits -> LDPC encode -> interleave -> reshape to the symbol/bit grid.
+        """
+        if not self.sionna:
+            # Uncoded fallback: "coded" bits are just random bits laid on the grid.
+            coded_grid = torch.randint(
+                0, 2, (batch_size, self.cfg.Nt, BITS_PER_SYMBOL), device=self.device
+            ).float()
+            info_bits = self.grid_to_stream(coded_grid)
+            return info_bits, coded_grid
+
+        info_np = torch.randint(0, 2, (batch_size, self.k_info), device=self.device).float()
+        coded = self._sionna_encode(info_np)              # (B, n_code)
+        coded_il = self._sionna_interleave(coded)         # (B, n_code)
+        coded_grid = self.stream_to_grid(coded_il)
+        return info_np, coded_grid
+
+    # ---- back end: detector extrinsic LLRs (grid) -> decoder -> a-priori LLRs (grid) ----
+
+    def decode_to_apriori(self, ext_llr_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One LDPC decode pass for the IDD loop.
+
+        Input:  ext_llr_grid (B, Nt, 8) = detector extrinsic LLRs on interleaved coded bits.
+        Output: (apriori_grid (B, Nt, 8), info_hat (B, k)).
+                apriori_grid = re-interleaved decoder *extrinsic* coded-bit LLRs, the next
+                a-priori for the detector. info_hat = hard info-bit decision (for BER).
+
+        Sign convention: this file uses L = log P(b=0)/P(b=1), while Sionna's
+        LDPC decoder expects the opposite sign, log P(b=1)/P(b=0). The wrapper
+        converts signs at the decoder boundary and keeps the detector-facing API
+        in the internal log p0/p1 convention. Verify this with the P0 round-trip
+        before trusting detector results.
+        """
+        if not self.sionna:
+            # Uncoded fallback: no decoder gain; pass the LLRs straight back, hard-slice info.
+            info_hat = (ext_llr_grid.reshape(ext_llr_grid.shape[0], -1) < 0.0).float()
+            return torch.zeros_like(ext_llr_grid), info_hat
+
+        ext_stream = self.grid_to_stream(ext_llr_grid)          # (B, n_code), interleaved domain
+        ext_deil = self._sionna_deinterleave(ext_stream)        # de-interleave to code domain, internal log p0/p1
+        sionna_input = -ext_deil                                # Sionna convention: log p1/p0
+        # Soft (a-posteriori) coded-bit LLRs from the decoder, converted back to
+        # the detector's internal log p0/p1 convention.
+        app_coded = -self._sionna_decode_soft(sionna_input)     # (B, n_code)
+        # Turbo extrinsic on the decoder side: subtract the decoder input in the
+        # same internal convention.
+        ext_coded = app_coded - ext_deil
+        apriori_il = self._sionna_interleave(ext_coded)         # back to interleaved domain
+        apriori_grid = self.stream_to_grid(apriori_il)
+        info_hat = self._sionna_decode_info(sionna_input)       # hard info bits for BER
+        return apriori_grid, info_hat
+
+    # ---- thin wrappers that bridge torch <-> Sionna tensors ----
+
+    def _sionna_encode(self, info_bits: torch.Tensor) -> torch.Tensor:
+        c = self.encoder(info_bits)
+        return c.to(self.device).float()
+
+    def _sionna_interleave(self, bits_or_llr: torch.Tensor) -> torch.Tensor:
+        return self.interleaver(bits_or_llr).to(self.device).float()
+
+    def _sionna_deinterleave(self, bits_or_llr: torch.Tensor) -> torch.Tensor:
+        return self.deinterleaver(bits_or_llr).to(self.device).float()
+
+    def _sionna_decode_soft(self, llr_code_domain: torch.Tensor) -> torch.Tensor:
+        return self.decoder(llr_code_domain).to(self.device).float()
+
+    def _sionna_decode_info(self, llr_code_domain: torch.Tensor) -> torch.Tensor:
+        return self.decoder_info(llr_code_domain).to(self.device).float()
+
+
+# -----------------------------
+# Linear baselines (ZF / LMMSE), hard-sliced
+# -----------------------------
+
+
+def linear_detector_bits(H: torch.Tensor, y: torch.Tensor, sigma2: float, kind: str = "lmmse") -> torch.Tensor:
+    """ZF or LMMSE hard-sliced bit estimates, shape (B, Nt, 8)."""
+    B, Nr, Nt = H.shape
+    Hh = H.conj().transpose(-1, -2)
+    R = torch.matmul(Hh, H)
+    z = torch.matmul(Hh, y[..., None]).squeeze(-1)
+    eye = torch.eye(Nt, device=H.device, dtype=H.dtype)[None, :, :]
+    if kind.lower() == "lmmse":
+        A = R + sigma2 * eye
+    elif kind.lower() == "zf":
+        A = R + 1e-8 * eye
+    else:
+        raise ValueError("kind must be 'zf' or 'lmmse'")
+    x_hat = torch.linalg.solve(A, z[..., None]).squeeze(-1)
+    return qam_to_bits(x_hat)
+
+
+@torch.no_grad()
+def kbest_list_bit_posterior(H: torch.Tensor, y: torch.Tensor, sigma2: float, beam_width: int = 128) -> torch.Tensor:
+    """Approximate list-MAP bit posterior P(b=1|y,H) via QR-domain K-best search.
+
+    This is a benchmark only. It keeps a list of low-distance 256-QAM vectors and
+    forms bit marginals by weighting list entries with exp(-||y-Hx||^2/sigma2).
+    """
+    device = H.device
+    search_dtype = torch.complex64
+    H_search = H.detach().to(device=device, dtype=search_dtype)
+    y_search = y.detach().to(device=device, dtype=search_dtype)
+    _, const_symbols = qam_constellation(device)
+    const_symbols = const_symbols.to(dtype=search_dtype)
+    B, _, Nt = H_search.shape
+    constellation_size = const_symbols.numel()
+    beam_width = max(1, int(beam_width))
+
+    Q, R = torch.linalg.qr(H_search, mode="reduced")
+    y_tilde = torch.matmul(Q.conj().transpose(-1, -2), y_search[..., None]).squeeze(-1)
+    paths = torch.zeros(B, 1, Nt, device=device, dtype=search_dtype)
+    metrics = torch.zeros(B, 1, device=device, dtype=torch.float32)
+
+    for level in range(Nt - 1, -1, -1):
+        if level + 1 < Nt:
+            interference = (paths[:, :, level + 1 :] * R[:, None, level, level + 1 :]).sum(dim=-1)
+        else:
+            interference = torch.zeros(B, paths.shape[1], device=device, dtype=search_dtype)
+        target = y_tilde[:, level, None] - interference
+        diagonal = R[:, level, level].view(B, 1, 1)
+        branch_metric = (target[:, :, None] - diagonal * const_symbols.view(1, 1, -1)).abs().square().real
+        flat_metric = (metrics[:, :, None] + branch_metric).reshape(B, -1)
+        keep = min(beam_width, flat_metric.shape[1])
+        metrics, best_flat = torch.topk(flat_metric, keep, dim=1, largest=False)
+
+        parent_idx = torch.div(best_flat, constellation_size, rounding_mode="floor")
+        symbol_idx = best_flat.remainder(constellation_size)
+        paths = torch.gather(paths, dim=1, index=parent_idx[..., None].expand(-1, -1, Nt)).clone()
+        paths[:, :, level] = const_symbols[symbol_idx]
+
+    list_bits = qam_to_bits(paths)  # (B, L, Nt, 8)
+    log_weights = -metrics / max(float(sigma2), 1e-12)
+    log_weights = log_weights - log_weights.max(dim=1, keepdim=True).values
+    weights = torch.exp(log_weights).to(list_bits.dtype).unsqueeze(-1).unsqueeze(-1)
+    posterior_one = (weights * list_bits).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-30)
+    return posterior_one.float().clamp(1e-5, 1.0 - 1e-5)
+
+
+# =============================================================================
+# Model components (warm-startable from the hard-decision L2A Transformer).
+# The architecture mirrors mimo_l2a_toy_5_20_2.py: edge-biased self-attention over
+# Nt symbol tokens, a recursive filtered state transition across T unfolded layers,
+# across-symbol autoregression (GRU), and I/Q-separated per-bit sigmoid heads. The ONLY
+# structural addition for soft IDD is the a-priori-LLR tilt on the head logit (C3).
+# =============================================================================
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, layers: int = 2):
+        super().__init__()
+        if layers == 1:
+            self.net = nn.Linear(in_dim, out_dim)
+        else:
+            mods: List[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+            for _ in range(layers - 2):
+                mods += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            mods.append(nn.Linear(hidden_dim, out_dim))
+            self.net = nn.Sequential(*mods)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class EdgeBiasedTransformerBlock(nn.Module):
+    """Self-attention block with complex edge-derived attention bias (R_ij features)."""
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.edge_mlp = MLP(4, d_ff, num_heads, layers=2)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, d_ff), nn.ReLU(), nn.Linear(d_ff, d_model))
+
+    def forward(self, h: torch.Tensor, edge_feat: torch.Tensor) -> torch.Tensor:
+        """h: (BK, Nt, d_model); edge_feat: (BK, Nt, Nt, 4)."""
+        x = self.ln1(h)
+        BK, Nt, _ = x.shape
+        qkv = self.qkv(x).view(BK, Nt, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        edge_bias = self.edge_mlp(edge_feat).permute(0, 3, 1, 2)  # (BK, H, Nt, Nt)
+        diag_mask = torch.eye(Nt, device=edge_bias.device, dtype=torch.bool)[None, None, :, :]
+        edge_bias = edge_bias.masked_fill(diag_mask, 0.0)
+        attn = torch.softmax(logits + edge_bias, dim=-1)
+        ctx = torch.matmul(attn, v).transpose(1, 2).contiguous().view(BK, Nt, self.d_model)
+        h = h + self.out(ctx)
+        h = h + self.ffn(self.ln2(h))
+        return h
+
+
+class SoftIDDDetector(nn.Module):
+    """Across-symbol autoregressive soft detector with a-priori-LLR tilting.
+
+    forward() outputs, per unfolded layer:
+      - net_logit  : per-bit logit L_net (prior-free; the network's own evidence)
+      - tilt_prob  : sigma(L_net - L^A), the prior-tilted Bernoulli probability used to sample
+      - bits       : sampled (or thresholded) bits drawn from tilt_prob
+      - logprob/entropy: for optional policy-gradient warm-start (kept for compatibility)
+    The a-priori LLR L^A enters ONLY at the head logit (C3); the backbone never takes it
+    as input. With L^A = 0 the model reduces exactly to the hard-decision detector, which
+    makes warm-start loading of the hard-decision checkpoint straightforward.
+    """
+
+    def __init__(
+        self,
+        Nt: int = 8,
+        d_model: int = 128,
+        num_heads: int = 4,
+        d_ff: int = 256,
+        T: int = 8,
+        init_bit_prob: float = 0.5,
+    ):
+        super().__init__()
+        self.Nt = Nt
+        self.d_model = d_model
+        self.T = T
+        self.node_mlp = MLP(6, d_ff, d_model, layers=2)
+        self.pos_emb = nn.Embedding(Nt, d_model)
+        self.state_mlp = MLP(QAM_ORDER + 2, d_ff, d_model, layers=2)
+        self.state_fuse_mlp = MLP(2 * d_model, d_ff, d_model, layers=2)
+        self.blocks = nn.ModuleList([EdgeBiasedTransformerBlock(d_model, num_heads, d_ff) for _ in range(T)])
+        self.ar_token_mlp = MLP(BITS_PER_SYMBOL + 2 + d_model, d_ff, d_model, layers=2)
+        self.ar_gru = nn.GRUCell(d_model, d_model)
+        self.head_i = MLP(2 * d_model, d_ff, AXIS_BITS, layers=2)
+        self.head_q = MLP(2 * d_model, d_ff, AXIS_BITS, layers=2)
+        self.init_proposal_heads(init_bit_prob)
+
+    def init_proposal_heads(self, init_bit_prob: float) -> None:
+        init_bit_prob = min(max(init_bit_prob, 1e-5), 1.0 - 1e-5)
+        init_bias = math.log(init_bit_prob / (1.0 - init_bit_prob))
+        for head in (self.head_i, self.head_q):
+            final_layer = head.net[-1] if isinstance(head.net, nn.Sequential) else head.net
+            if isinstance(final_layer, nn.Linear):
+                nn.init.normal_(final_layer.weight, mean=0.0, std=1e-3)
+                nn.init.constant_(final_layer.bias, init_bias)
+
+    def build_context(self, H: torch.Tensor, y: torch.Tensor, sigma2: float, K: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Node context (z = H^H y, diag(R), sigma2, idx) and edge features (R_ij)."""
+        B, Nr, Nt = H.shape
+        Hh = H.conj().transpose(-1, -2)
+        R = torch.matmul(Hh, H)
+        z = torch.matmul(Hh, y[..., None]).squeeze(-1)
+        sigma_col = torch.full((B, Nt, 1), float(sigma2), device=H.device)
+        idx = torch.arange(Nt, device=H.device).float()[None, :, None].expand(B, Nt, 1) / max(Nt - 1, 1)
+        diag_R = R.diagonal(dim1=-2, dim2=-1).real.unsqueeze(-1)
+        node_feat = torch.cat(
+            [z.real.unsqueeze(-1), z.imag.unsqueeze(-1), z.abs().unsqueeze(-1), diag_R, sigma_col, idx], dim=-1
+        ).float()
+        pos = self.pos_emb(torch.arange(Nt, device=H.device))[None, :, :]
+        Z0 = self.node_mlp(node_feat) + pos
+        Z = Z0[:, None, :, :].expand(B, K, Nt, self.d_model).contiguous()
+        angle = torch.angle(R)
+        edge_feat = torch.stack([R.real, R.imag, R.abs(), angle], dim=-1).float()
+        edge_feat = edge_feat[:, None, :, :, :].expand(B, K, Nt, Nt, 4).contiguous()
+        return Z, edge_feat
+
+    def encode_solution_state(self, bits: torch.Tensor) -> torch.Tensor:
+        """Encode the previous refined 256-QAM solution for the recursive transition."""
+        bit_weights = (2 ** torch.arange(BITS_PER_SYMBOL, device=bits.device)).view(1, 1, 1, -1)
+        symbol_idx = (bits.round().long() * bit_weights).sum(dim=-1)
+        symbol_one_hot = F.one_hot(symbol_idx, num_classes=QAM_ORDER).float()
+        x_prev = bits_to_qam(bits)
+        state_feat = torch.cat(
+            [symbol_one_hot, x_prev.real.unsqueeze(-1), x_prev.imag.unsqueeze(-1)], dim=-1
+        )
+        return self.state_mlp(state_feat)
+
+    def forward(
+        self,
+        H: torch.Tensor,
+        y: torch.Tensor,
+        sigma2: float,
+        init_bits: torch.Tensor,
+        apriori_llr: Optional[torch.Tensor] = None,
+        sample: bool = True,
+        llr_clip: float = 20.0,
+    ) -> Dict[str, object]:
+        """
+        Args:
+            H: (B, Nr, Nt); y: (B, Nr); init_bits: (B, K, Nt, 8)
+            apriori_llr: (B, Nt, 8) a-priori LLRs L^A (broadcast over K). None == 0 (no prior).
+        Returns dict with per-layer lists of net_logit / tilt_prob / bits and trajectory stats.
+        """
+        B, K, Nt, _ = init_bits.shape
+        assert Nt == self.Nt
+        Z, edge_feat = self.build_context(H, y, sigma2, K=K)
+        bits_prev = init_bits.float()
+        BK = B * K
+        edge_flat = edge_feat.view(BK, Nt, Nt, 4)
+
+        # A-priori LLR as a (B,1,Nt,8) tensor broadcastable across K; clip for stability.
+        if apriori_llr is None:
+            la = torch.zeros(B, 1, Nt, BITS_PER_SYMBOL, device=H.device)
+        else:
+            la = apriori_llr.clamp(-llr_clip, llr_clip)[:, None, :, :]
+
+        net_logit_per_layer: List[torch.Tensor] = []
+        tilt_prob_per_layer: List[torch.Tensor] = []
+        bits_per_layer: List[torch.Tensor] = []
+        logprob_per_layer: List[torch.Tensor] = []
+        entropy_per_layer: List[torch.Tensor] = []
+        logprob = torch.zeros(B, K, device=H.device)
+        entropy = torch.zeros(B, K, device=H.device)
+
+        for block in self.blocks:
+            state_emb = self.encode_solution_state(bits_prev)
+            Z = self.state_fuse_mlp(torch.cat([Z, state_emb], dim=-1))
+            Z_flat = Z.view(BK, Nt, self.d_model)
+            Z_flat = block(Z_flat, edge_flat)
+            Z = Z_flat.view(B, K, Nt, self.d_model)
+
+            ar_state = torch.zeros(BK, self.d_model, device=H.device)
+            net_logit_list: List[torch.Tensor] = []
+            tilt_prob_list: List[torch.Tensor] = []
+            new_bits_list: List[torch.Tensor] = []
+            layer_logprob = torch.zeros(B, K, device=H.device)
+            layer_entropy = torch.zeros(B, K, device=H.device)
+
+            for i in range(Nt):
+                zi = Z_flat[:, i, :]
+                head_in = torch.cat([zi, ar_state], dim=-1)
+                # Network's own per-bit logits (prior-free). CONVENTION: the head logit is the
+                # logit of P(b=1), i.e. sigmoid(net_logit) = P_net(b=1). This matches the
+                # hard-decision code (its heads feed sigmoid -> bernoulli on P(b=1)), so a
+                # warm-started checkpoint keeps its meaning exactly.
+                net_logit_i = self.head_i(head_in)  # (BK, AXIS_BITS)
+                net_logit_q = self.head_q(head_in)  # (BK, AXIS_BITS)
+                net_logit = torch.cat([net_logit_i, net_logit_q], dim=-1)  # (BK, 8) = logit P(b=1)
+
+                # ---- C3: a-priori tilt (product of experts = addition of LLRs). The a-priori
+                #          LLR is in the L = log p(b=0)/p(b=1) domain (see sample_apriori_llr),
+                #          so its logit-of-P(b=1) contribution is (-L^A). Hence the tilt SUBTRACTS
+                #          la from the head logit. tilt_prob is therefore P(b=1). The prior
+                #          reshapes the sampling distribution only; the network never ingests it.
+                la_i = la[:, :, i, :].expand(B, K, BITS_PER_SYMBOL).reshape(BK, BITS_PER_SYMBOL)
+                tilt_logit_p1 = net_logit - la_i                     # logit of tilted P(b=1)
+                tilt_prob = torch.sigmoid(tilt_logit_p1).clamp(1e-5, 1.0 - 1e-5)  # P(b=1)
+
+                if sample:
+                    bit = torch.bernoulli(tilt_prob)
+                else:
+                    bit = (tilt_prob >= 0.5).float()
+
+                # Trajectory log-prob / entropy under the tilted sampling distribution.
+                lp = bit * torch.log(tilt_prob) + (1.0 - bit) * torch.log(1.0 - tilt_prob)
+                ent = -(tilt_prob * torch.log(tilt_prob) + (1.0 - tilt_prob) * torch.log(1.0 - tilt_prob))
+                layer_logprob = layer_logprob + lp.sum(dim=-1).view(B, K)
+                layer_entropy = layer_entropy + ent.sum(dim=-1).view(B, K)
+
+                net_logit_list.append(net_logit.view(B, K, 1, BITS_PER_SYMBOL))
+                tilt_prob_list.append(tilt_prob.view(B, K, 1, BITS_PER_SYMBOL))
+                new_bits_list.append(bit.view(B, K, 1, BITS_PER_SYMBOL))
+
+                # Update the across-symbol AR state with the newly generated symbol bits.
+                bi_bk = bit.view(BK, 1, BITS_PER_SYMBOL)
+                xi = bits_to_qam(bi_bk).view(BK)
+                ar_feat = torch.cat([bit, xi.real.unsqueeze(-1), xi.imag.unsqueeze(-1), zi], dim=-1)
+                ar_token = self.ar_token_mlp(ar_feat)
+                ar_state = self.ar_gru(ar_token, ar_state)
+
+            net_logit_curr = torch.cat(net_logit_list, dim=2)   # (B,K,Nt,8)
+            tilt_prob_curr = torch.cat(tilt_prob_list, dim=2)   # (B,K,Nt,8)
+            bits_curr = torch.cat(new_bits_list, dim=2)         # (B,K,Nt,8)
+
+            net_logit_per_layer.append(net_logit_curr)
+            tilt_prob_per_layer.append(tilt_prob_curr)
+            bits_per_layer.append(bits_curr)
+            logprob_per_layer.append(layer_logprob)
+            entropy_per_layer.append(layer_entropy)
+            logprob = logprob + layer_logprob
+            entropy = entropy + layer_entropy
+            bits_prev = bits_curr
+
+        return {
+            "net_logit_per_layer": net_logit_per_layer,
+            "tilt_prob_per_layer": tilt_prob_per_layer,
+            "bits_per_layer": bits_per_layer,
+            "final_bits": bits_prev,
+            "final_net_logit": net_logit_per_layer[-1],
+            "final_tilt_prob": tilt_prob_per_layer[-1],
+            "logprob_per_layer": logprob_per_layer,
+            "entropy_per_layer": entropy_per_layer,
+            "logprob": logprob,
+            "entropy": entropy,
+        }
+
+
+def load_hard_decision_warmstart(model: SoftIDDDetector, ckpt_path: str, device: torch.device) -> List[str]:
+    """Warm-start: load matching tensors from a hard-decision checkpoint.
+
+    Loads only parameters whose name and shape match (backbone, AR path, heads). Modules
+    that differ are left at their initialization. Returns the list of loaded keys.
+    """
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and "model_state" in state:
+        state = state["model_state"]
+    elif isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    own = model.state_dict()
+    loaded: List[str] = []
+    for k, v in state.items():
+        if k in own and own[k].shape == v.shape:
+            own[k] = v
+            loaded.append(k)
+    model.load_state_dict(own)
+    return loaded
+
+
+# =============================================================================
+# Soft output: Rao-Blackwellized posterior LLR + turbo extrinsic (C4).
+# =============================================================================
+
+
+def posterior_llr_from_tilt(tilt_prob: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Rao-Blackwellized posterior LLR from tilted Bernoulli probabilities.
+
+    tilt_prob: (B, K, Nt, 8) = P(b=1) = sigma(L_net - L^A) per particle. We average the
+    *probabilities* over the K parallel particles (lower variance than counting hard
+    bits), then convert to an LLR L_post = log p(b=0)/p(b=1).
+
+    Convention: probabilities here are P(bit = 1). With L = log p0/p1 we therefore use
+    L_post = log( (1-pbar) / pbar ).
+    """
+    pbar = tilt_prob.mean(dim=1).clamp(eps, 1.0 - eps)  # (B, Nt, 8) = mean P(b=1)
+    return torch.log((1.0 - pbar) / pbar)
+
+
+def extrinsic_llr(post_llr: torch.Tensor, apriori_llr: Optional[torch.Tensor], llr_clip: float = 20.0) -> torch.Tensor:
+    """Turbo extrinsic L_E = L_post - L^A (subtract the bit's own prior). C4."""
+    if apriori_llr is None:
+        ext = post_llr
+    else:
+        ext = post_llr - apriori_llr
+    return ext.clamp(-llr_clip, llr_clip)
+
+
+def llr_to_bit_prob(llr: torch.Tensor) -> torch.Tensor:
+    """P(b=1) from L = log p0/p1: p1 = sigma(-L)."""
+    return torch.sigmoid(-llr)
+
+
+# =============================================================================
+# IDD inference loop (C5): detector -> extrinsic -> LDPC -> a-priori -> repeat.
+# =============================================================================
+
+
+@torch.no_grad()
+def run_idd_inference(
+    model: SoftIDDDetector,
+    coded_system: CodedSystem,
+    H: torch.Tensor,
+    y: torch.Tensor,
+    coded_grid: torch.Tensor,
+    info_bits: torch.Tensor,
+    cfg: MIMOConfig,
+    K: int,
+    num_idd_iter: int,
+    init_mode: str = "lmmse",
+) -> Dict[str, object]:
+    """Run the full iterative soft demodulation + soft decoding loop.
+
+    Returns per-iteration coded-bit BER (post-detector) and post-LDPC coded/info BER.
+    """
+    model.eval()
+    device = H.device
+    sigma2 = cfg.sigma2
+
+    init_bits = initialize_candidates(H, y, sigma2, K, mode=init_mode)
+    apriori = torch.zeros(H.shape[0], cfg.Nt, BITS_PER_SYMBOL, device=device)  # L^{A,1} = 0
+
+    det_coded_ber: List[float] = []
+    dec_coded_ber: List[float] = []
+    dec_info_ber: List[float] = []
+
+    for _ in range(max(1, num_idd_iter)):
+        out = model(H, y, sigma2, init_bits, apriori_llr=apriori, sample=True)
+        tilt_prob = out["final_tilt_prob"]  # (B,K,Nt,8)
+
+        # Detector posterior + extrinsic.
+        post = posterior_llr_from_tilt(tilt_prob)             # (B,Nt,8)
+        ext = extrinsic_llr(post, apriori)                    # (B,Nt,8)
+
+        # Detector hard decision on coded bits (BER vs the known coded grid).
+        det_bits = (llr_to_bit_prob(post) >= 0.5).float()
+        det_coded_ber.append(bit_error_rate(det_bits, coded_grid))
+
+        # LDPC decode -> next a-priori + hard info decision.
+        apriori_next, info_hat = coded_system.decode_to_apriori(ext)
+
+        # Post-LDPC coded-bit BER: re-encode the decoded info, compare to coded grid.
+        if coded_system.sionna:
+            coded_hat_stream = coded_system._sionna_encode(info_hat)
+            coded_hat_grid = coded_system.stream_to_grid(coded_system._sionna_interleave(coded_hat_stream))
+            dec_coded_ber.append(bit_error_rate(coded_hat_grid, coded_grid))
+            dec_info_ber.append(bit_error_rate(info_hat, info_bits))
+        else:
+            dec_coded_ber.append(bit_error_rate(det_bits, coded_grid))
+            dec_info_ber.append(float("nan"))
+
+        apriori = apriori_next
+
+    return {
+        "det_coded_ber": det_coded_ber,
+        "dec_coded_ber": dec_coded_ber,
+        "dec_info_ber": dec_info_ber,
+        "final_det_coded_ber": det_coded_ber[-1],
+        "final_dec_coded_ber": dec_coded_ber[-1],
+        "final_dec_info_ber": dec_info_ber[-1],
+    }
+
+
+@torch.no_grad()
+def online_one_decoder_pass_test(
+    model: SoftIDDDetector,
+    cfg: MIMOConfig,
+    args,
+    device: torch.device,
+) -> Tuple[float, float, float, float]:
+    """Light training-time two-pass test.
+
+    Pass 1: detector with L_A=0 -> decoder.
+    Pass 2: detector with decoder-derived prior from pass 1 -> decoder again.
+    This mirrors the current one-pass-prior training structure and is only a
+    monitor; it does not affect training or gradients.
+    """
+    was_training = model.training
+    model.eval()
+    coded_system = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter,
+                               device=device, cn_update=args.cn_update)
+    first_coded_acc: List[float] = []
+    first_info_acc: List[float] = []
+    second_coded_acc: List[float] = []
+    second_info_acc: List[float] = []
+    for _ in range(max(1, int(args.test_batches))):
+        info_bits, coded_grid = coded_system.generate_coded_grid(args.test_batch_size)
+        H = make_channel(args.test_batch_size, cfg, device)
+        y, _ = transmit(H, coded_grid, cfg)
+        init_bits = initialize_candidates(H, y, cfg.sigma2, args.K_test, mode=args.init_mode)
+
+        # First detector pass: no prior.
+        out = model(H, y, cfg.sigma2, init_bits, apriori_llr=None, sample=True, llr_clip=args.llr_clip)
+        post1 = posterior_llr_from_tilt(out["final_tilt_prob"])
+        bits1 = (llr_to_bit_prob(post1) >= 0.5).float()
+        first_coded_acc.append(bit_error_rate(bits1, coded_grid))
+        apriori2, info_hat1 = coded_system.decode_to_apriori(post1)
+        if coded_system.sionna:
+            first_info_acc.append(bit_error_rate(info_hat1, info_bits))
+
+        # Second detector pass: decoder-derived prior from pass 1, then decode pass-2 extrinsic.
+        out2 = model(H, y, cfg.sigma2, init_bits, apriori_llr=apriori2, sample=True, llr_clip=args.llr_clip)
+        post2 = posterior_llr_from_tilt(out2["final_tilt_prob"])
+        ext2 = extrinsic_llr(post2, apriori2, llr_clip=args.llr_clip)
+        bits2 = (llr_to_bit_prob(post2) >= 0.5).float()
+        second_coded_acc.append(bit_error_rate(bits2, coded_grid))
+        _apriori3, info_hat2 = coded_system.decode_to_apriori(ext2)
+        if coded_system.sionna:
+            second_info_acc.append(bit_error_rate(info_hat2, info_bits))
+
+    if was_training:
+        model.train()
+    first_info = float(np.mean(first_info_acc)) if first_info_acc else float("nan")
+    second_info = float(np.mean(second_info_acc)) if second_info_acc else float("nan")
+    return (
+        float(np.mean(first_coded_acc)),
+        first_info,
+        float(np.mean(second_coded_acc)),
+        second_info,
+    )
+
+
+def hard_bits_to_internal_llr(bits: torch.Tensor, llr_mag: float) -> torch.Tensor:
+    """Convert hard bits to internal L=log p0/p1 LLRs with fixed reliability."""
+    return (1.0 - 2.0 * bits.float()) * float(llr_mag)
+
+
+@torch.no_grad()
+def run_startup_detection_benchmarks(
+    coded_system: CodedSystem,
+    cfg: MIMOConfig,
+    args,
+    device: torch.device,
+) -> None:
+    """Run ZF/LMMSE/list-MAP once before neural training starts."""
+    if not args.run_startup_benchmarks:
+        return
+
+    methods = ["zf", "lmmse", "listmap"]
+    coded_acc = {name: [] for name in methods}
+    info_acc = {name: [] for name in methods}
+
+    print("\n=== Startup detection benchmarks (single detector -> one LDPC decoder pass) ===")
+    print(
+        f"Benchmark setup: SNR={cfg.snr_db:.1f} dB | batches={args.benchmark_batches} "
+        f"batch_size={args.benchmark_batch_size} | listMAP_width={args.listmap_width}"
+    )
+
+    for _ in range(max(1, int(args.benchmark_batches))):
+        info_bits, coded_grid = coded_system.generate_coded_grid(args.benchmark_batch_size)
+        H = make_channel(args.benchmark_batch_size, cfg, device)
+        y, _ = transmit(H, coded_grid, cfg)
+
+        for kind in ("zf", "lmmse"):
+            det_bits = linear_detector_bits(H, y, cfg.sigma2, kind=kind)
+            coded_acc[kind].append(bit_error_rate(det_bits, coded_grid))
+            det_llr = hard_bits_to_internal_llr(det_bits, args.benchmark_hard_llr_mag)
+            _apriori_next, info_hat = coded_system.decode_to_apriori(det_llr)
+            if coded_system.sionna:
+                info_acc[kind].append(bit_error_rate(info_hat, info_bits))
+
+        posterior_one = kbest_list_bit_posterior(H, y, cfg.sigma2, beam_width=args.listmap_width)
+        list_llr = torch.log((1.0 - posterior_one) / posterior_one).clamp(-args.llr_clip, args.llr_clip)
+        list_bits = (posterior_one >= 0.5).float()
+        coded_acc["listmap"].append(bit_error_rate(list_bits, coded_grid))
+        _apriori_next, info_hat = coded_system.decode_to_apriori(list_llr)
+        if coded_system.sionna:
+            info_acc["listmap"].append(bit_error_rate(info_hat, info_bits))
+
+    for name in methods:
+        info_ber = float(np.mean(info_acc[name])) if info_acc[name] else float("nan")
+        print(
+            f"{name.upper():>7s} | coded_BER={float(np.mean(coded_acc[name])):.4e} "
+            f"| onepass_info_BER={info_ber:.4e}"
+        )
+    print("=== End startup benchmarks ===\n")
+
+
+def initialize_candidates(H: torch.Tensor, y: torch.Tensor, sigma2: float, K: int, mode: str = "lmmse") -> torch.Tensor:
+    """K initial particle bit grids per channel instance, shape (B, K, Nt, 8).
+
+    These are not selected/competed at the end. They are parallel stochastic detector
+    trajectories whose tilted probabilities are averaged into the final soft LLR.
+    """
+    B, _, Nt = H.shape
+    if mode.lower() == "random":
+        return torch.randint(0, 2, (B, K, Nt, BITS_PER_SYMBOL), device=H.device).float()
+    base = linear_detector_bits(H, y, sigma2, kind="lmmse").float()  # (B, Nt, 8)
+    cand = base[:, None, :, :].expand(B, K, Nt, BITS_PER_SYMBOL).contiguous()
+    if K > 1:
+        # Diversify particles >0 by random bit flips (cheap exploration around LMMSE).
+        flip = (torch.rand(B, K, Nt, BITS_PER_SYMBOL, device=H.device) < 0.05).float()
+        flip[:, 0] = 0.0  # keep the first particle at the clean LMMSE slice
+        cand = (cand + flip) % 2.0
+    return cand
+
+
+# =============================================================================
+# Phase-1 training: synthetic consistent-Gaussian a-priori + population BCE (C6/C7).
+# =============================================================================
+
+
+def population_bce_on_coded_bits(tilt_prob_per_layer: List[torch.Tensor], coded_grid: torch.Tensor) -> torch.Tensor:
+    """Population BCE against the known coded bits, averaged over layers/particles/bits.
+
+    tilt_prob_per_layer: list of (B,K,Nt,8) with P(b=1). coded_grid: (B,Nt,8) in {0,1}.
+    """
+    probs = torch.stack(tilt_prob_per_layer, dim=0).clamp(1e-5, 1.0 - 1e-5)  # (T,B,K,Nt,8)
+    target = coded_grid[None, :, None, :, :].expand_as(probs)
+    bce = -(target * torch.log(probs) + (1.0 - target) * torch.log(1.0 - probs))
+    return bce.mean()
+
+
+def per_particle_bce_on_coded_bits(tilt_prob: torch.Tensor, coded_grid: torch.Tensor) -> torch.Tensor:
+    """Per-particle BCE, shape (B,K), for residual/BCE curriculum scoring."""
+    probs = tilt_prob.clamp(1e-5, 1.0 - 1e-5)
+    target = coded_grid[:, None, :, :].to(dtype=probs.dtype).expand_as(probs)
+    bce = -(target * torch.log(probs) + (1.0 - target) * torch.log(1.0 - probs))
+    return bce.mean(dim=(-1, -2))
+
+
+def normalize_positive_metric(metric: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Scale a positive cost so residual energy and BCE can share one curriculum."""
+    scale = metric.detach().mean().abs().clamp_min(eps)
+    return metric / scale
+
+
+def residual_bce_curriculum_weights(
+    step: int,
+    residual_only_until: int,
+    hybrid_from: int,
+    residual_floor: float,
+) -> Tuple[float, float]:
+    """Residual/BCE weights for the soft Phase-1 curriculum.
+
+    The schedule is pure residual at the beginning, linearly turns on BCE, and
+    ends in a residual/BCE hybrid instead of discarding the residual signal.
+    """
+    residual_only_until = max(0, int(residual_only_until))
+    hybrid_from = max(residual_only_until + 1, int(hybrid_from))
+    residual_floor = min(max(float(residual_floor), 0.0), 1.0)
+    if step <= residual_only_until:
+        return 1.0, 0.0
+    if step >= hybrid_from:
+        return residual_floor, 1.0 - residual_floor
+    transition = (step - residual_only_until) / float(hybrid_from - residual_only_until)
+    residual_weight = 1.0 - transition * (1.0 - residual_floor)
+    return residual_weight, 1.0 - residual_weight
+
+
+def residual_policy_gradient_loss(
+    bits_per_layer: List[torch.Tensor],
+    tilt_prob_per_layer: List[torch.Tensor],
+    logprob_per_layer: List[torch.Tensor],
+    coded_grid: torch.Tensor,
+    H: torch.Tensor,
+    y: torch.Tensor,
+    sigma2: float,
+    residual_weight: float,
+    bce_weight: float,
+    advantage_clip: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score-function residual objective for sampled detector particles.
+
+    residual_energy(bits) is not differentiable through Bernoulli samples, so the
+    residual component trains the sampler through trajectory log-probabilities.
+    BCE is included in the score only to make the PG reward follow the same
+    curriculum as the direct supervised BCE term.
+    """
+    layer_residual = torch.stack([residual_energy(bits_t, H, y, sigma2) for bits_t in bits_per_layer], dim=0)
+    layer_bce = torch.stack([per_particle_bce_on_coded_bits(prob_t, coded_grid) for prob_t in tilt_prob_per_layer], dim=0)
+    layer_scores = (
+        float(residual_weight) * normalize_positive_metric(layer_residual)
+        + float(bce_weight) * normalize_positive_metric(layer_bce)
+    )
+
+    logprob_stack = torch.stack(logprob_per_layer, dim=0)  # (T,B,K)
+    returns = torch.stack([layer_scores[t:].mean(dim=0) for t in range(layer_scores.shape[0])], dim=0)
+    if returns.shape[-1] > 1:
+        baseline = returns.mean(dim=2, keepdim=True)
+        scale = returns.std(dim=2, keepdim=True, unbiased=False)
+    else:
+        baseline = returns.mean()
+        scale = returns.std(unbiased=False)
+    advantage = (returns - baseline) / scale.clamp_min(1e-6)
+    advantage = advantage.clamp(-float(advantage_clip), float(advantage_clip))
+    pg_loss = (advantage.detach() * logprob_stack).mean()
+    return pg_loss, layer_residual[-1].mean(), layer_scores[-1].mean()
+
+
+def sample_i_a(batch_size: int, device: torch.device, mode: str = "uniform") -> torch.Tensor:
+    """Sample an a-priori mutual information I_A in [0,1] per instance (covers all priors)."""
+    if mode == "uniform":
+        return torch.rand(batch_size, device=device)
+    if mode == "beta":
+        # Slightly emphasize the informative-prior region; still spans [0,1].
+        a = torch.distributions.Beta(1.5, 1.5).sample((batch_size,)).to(device)
+        return a
+    raise ValueError(f"Unsupported I_A sampling mode: {mode}")
+
+
+def decoder_prior_damping_from_ber(first_pass_ber: float, args) -> float:
+    """Adaptive decoder-prior scale: weak early, stronger once first-pass BER improves."""
+    start = float(args.decoder_prior_damping_start)
+    end = float(args.decoder_prior_damping_end)
+    ber_high = float(args.decoder_prior_ramp_ber_high)
+    ber_low = float(args.decoder_prior_ramp_ber_low)
+    if ber_high <= ber_low:
+        return start
+    if first_pass_ber >= ber_high:
+        return start
+    if first_pass_ber <= ber_low:
+        return end
+    progress = (ber_high - first_pass_ber) / (ber_high - ber_low)
+    return start + progress * (end - start)
+
+
+@torch.no_grad()
+def decoder_training_prior_from_post(
+    coded_system: CodedSystem,
+    post_llr: torch.Tensor,
+    llr_clip: float,
+    damping: float = 1.0,
+) -> torch.Tensor:
+    """Build a detector a-priori from detached detector posterior LLRs.
+
+    The caller computes the first detector pass and may apply an auxiliary BCE
+    loss to it. This helper only performs the fixed LDPC decoder pass under
+    no_grad and returns decoder extrinsic LLRs in the detector's convention.
+    """
+    apriori, _info_hat = coded_system.decode_to_apriori(post_llr.clamp(-llr_clip, llr_clip))
+    apriori = (float(damping) * apriori).clamp(-llr_clip, llr_clip)
+    return apriori
+
+
+def train_phase1(args) -> None:
+    """Phase-1: train the tied soft detector with Gaussian or decoder-derived priors."""
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    set_seed(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    cfg = MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=args.snr_db)
+    coded_system = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter,
+                               device=device, cn_update=args.cn_update)
+    print(f"Sionna available: {SIONNA_AVAILABLE} | n_code={coded_system.n_code} "
+          f"k_info={coded_system.k_info} coderate={args.coderate}")
+
+    run_startup_detection_benchmarks(coded_system, cfg, args, device)
+
+    model = SoftIDDDetector(
+        Nt=cfg.Nt, d_model=args.d_model, num_heads=args.heads, d_ff=args.d_ff,
+        T=args.layers, init_bit_prob=args.init_bit_prob,
+    ).to(device)
+
+    if args.weight_init == "warmstart" and args.warmstart and os.path.exists(args.warmstart):
+        loaded = load_hard_decision_warmstart(model, args.warmstart, device)
+        print(f"Warm-started {len(loaded)} tensors from {args.warmstart}")
+    elif args.weight_init == "warmstart":
+        print(f"Requested warm-start but checkpoint was not found: {args.warmstart}")
+        print("Continuing with random network initialization.")
+    else:
+        print("Network weight initialization: random (no warm-start checkpoint loaded).")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    metrics_path = os.path.join(args.out_dir, "phase1_metrics.csv")
+    fieldnames = [
+        "step",
+        "loss_mode",
+        "prior_source",
+        "i_a_mean",
+        "apriori_abs_mean",
+        "decoder_prior_damping",
+        "first_pass_coded_ber",
+        "first_pass_bce",
+        "prior_tilt_bce",
+        "residual_weight",
+        "bce_weight",
+        "train_bce",
+        "train_residual_energy",
+        "train_residual_pg_loss",
+        "train_coded_ber",
+        "online_first_coded_ber",
+        "online_first_info_ber",
+        "online_second_coded_ber",
+        "online_second_info_ber",
+        "loss",
+    ]
+    with open(metrics_path, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+
+    history: List[Dict[str, object]] = []
+
+    for step in range(1, args.steps + 1):
+        model.train()
+        # --- generate a coded batch (encode + interleave; outside the learning process) ---
+        info_bits, coded_grid = coded_system.generate_coded_grid(args.batch_size)
+        H = make_channel(args.batch_size, cfg, device)
+        y, _ = transmit(H, coded_grid, cfg)
+        init_bits = initialize_candidates(H, y, cfg.sigma2, args.K_train, mode=args.init_mode)
+
+        # --- build detector a-priori LLRs for this batch ---
+        prior_source = args.prior_source
+        if prior_source == "mixed":
+            use_decoder_prior = torch.rand((), device=device).item() < args.decoder_prior_prob
+            prior_source = "decoder_onepass" if use_decoder_prior else "gaussian"
+
+        i_a_mean = float("nan")
+        first_pass_coded_ber = float("nan")
+        decoder_prior_damping = float("nan")
+        first_pass_bce: Optional[torch.Tensor] = None
+        if prior_source == "gaussian":
+            # Classical EXIT-style synthetic prior. Efficient but context-agnostic.
+            i_a = sample_i_a(args.batch_size, device, mode=args.i_a_mode)  # (B,)
+            i_a_grid = i_a[:, None, None].expand(args.batch_size, cfg.Nt, BITS_PER_SYMBOL)
+            apriori = sample_apriori_llr(coded_grid, i_a_grid, llr_clip=args.llr_clip)
+            i_a_mean = float(i_a.mean().item())
+        elif prior_source == "decoder_onepass":
+            # Context-aware, one-step detector->decoder prior. This approximates the
+            # second detector iteration without rolling out a full IDD training loop.
+            # The first pass is also supervised by BCE so the decoder-prior source
+            # itself learns good no-prior soft outputs.
+            out_first = model(H, y, cfg.sigma2, init_bits, apriori_llr=None, sample=True, llr_clip=args.llr_clip)
+            first_pass_bce = population_bce_on_coded_bits(out_first["tilt_prob_per_layer"], coded_grid)
+            with torch.no_grad():
+                post0 = posterior_llr_from_tilt(out_first["final_tilt_prob"].detach()).clamp(-args.llr_clip, args.llr_clip)
+                det_bits0 = (llr_to_bit_prob(post0) >= 0.5).float()
+                first_pass_coded_ber = bit_error_rate(det_bits0, coded_grid)
+                decoder_prior_damping = decoder_prior_damping_from_ber(first_pass_coded_ber, args)
+                apriori = decoder_training_prior_from_post(
+                    coded_system,
+                    post0,
+                    llr_clip=args.llr_clip,
+                    damping=decoder_prior_damping,
+                )
+        else:
+            raise ValueError(f"Unsupported prior_source: {args.prior_source}")
+        apriori_abs_mean = float(apriori.detach().abs().mean().item())
+
+        out = model(H, y, cfg.sigma2, init_bits, apriori_llr=apriori, sample=True, llr_clip=args.llr_clip)
+
+        # --- population BCE on the prior-tilted outputs (C7) ---
+        prior_tilt_bce = population_bce_on_coded_bits(out["tilt_prob_per_layer"], coded_grid)
+        if first_pass_bce is None:
+            first_pass_bce = prior_tilt_bce.new_tensor(0.0)
+        bce = prior_tilt_bce + float(args.first_pass_bce_weight) * first_pass_bce
+        final_residual_energy = residual_energy(out["bits_per_layer"][-1].detach(), H, y, cfg.sigma2).mean()
+        residual_pg_loss = bce.new_tensor(0.0)
+        residual_weight = 0.0
+        bce_weight = 1.0
+
+        if args.loss_mode == "pure_bce":
+            loss = bce
+        elif args.loss_mode == "residual_hybrid":
+            residual_weight, bce_weight = residual_bce_curriculum_weights(
+                step,
+                args.metric_residual_until,
+                args.metric_hybrid_from,
+                args.metric_residual_floor,
+            )
+            residual_pg_loss, final_residual_energy, _score_mean = residual_policy_gradient_loss(
+                out["bits_per_layer"],
+                out["tilt_prob_per_layer"],
+                out["logprob_per_layer"],
+                coded_grid,
+                H,
+                y,
+                cfg.sigma2,
+                residual_weight=residual_weight,
+                bce_weight=bce_weight,
+                advantage_clip=args.advantage_clip,
+            )
+            balanced_pg = residual_pg_loss / residual_pg_loss.detach().abs().clamp_min(1e-6)
+            balanced_bce = bce / bce.detach().abs().clamp_min(1e-6)
+            loss = residual_weight * balanced_pg + bce_weight * balanced_bce
+        else:
+            raise ValueError(f"Unsupported loss_mode: {args.loss_mode}")
+
+        with torch.no_grad():
+            train_post = posterior_llr_from_tilt(out["final_tilt_prob"].detach())
+            train_det_bits = (llr_to_bit_prob(train_post) >= 0.5).float()
+            train_second_coded_ber = bit_error_rate(train_det_bits, coded_grid)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+
+        do_log = step % args.log_every == 0 or step == 1
+        do_online_test = args.test_every > 0 and step % args.test_every == 0
+        if do_log or do_online_test:
+            with torch.no_grad():
+                post = posterior_llr_from_tilt(out["final_tilt_prob"])
+                det_bits = (llr_to_bit_prob(post) >= 0.5).float()
+                coded_ber = train_second_coded_ber
+            online_first_coded_ber = float("nan")
+            online_first_info_ber = float("nan")
+            online_second_coded_ber = float("nan")
+            online_second_info_ber = float("nan")
+            if do_online_test:
+                (
+                    online_first_coded_ber,
+                    online_first_info_ber,
+                    online_second_coded_ber,
+                    online_second_info_ber,
+                ) = online_one_decoder_pass_test(model, cfg, args, device)
+            row = {
+                "step": step,
+                "loss_mode": args.loss_mode,
+                "prior_source": prior_source,
+                "i_a_mean": i_a_mean,
+                "apriori_abs_mean": apriori_abs_mean,
+                "decoder_prior_damping": decoder_prior_damping,
+                "first_pass_coded_ber": first_pass_coded_ber,
+                "first_pass_bce": float(first_pass_bce.item()),
+                "prior_tilt_bce": float(prior_tilt_bce.item()),
+                "residual_weight": float(residual_weight),
+                "bce_weight": float(bce_weight),
+                "train_bce": float(bce.item()),
+                "train_residual_energy": float(final_residual_energy.item()),
+                "train_residual_pg_loss": float(residual_pg_loss.item()),
+                "train_coded_ber": float(coded_ber),
+                "online_first_coded_ber": online_first_coded_ber,
+                "online_first_info_ber": online_first_info_ber,
+                "online_second_coded_ber": online_second_coded_ber,
+                "online_second_info_ber": online_second_info_ber,
+                "loss": float(loss.item()),
+            }
+            history.append(row)
+            with open(metrics_path, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
+            make_plots(metrics_path, args.out_dir)
+            save_curves_pt(metrics_path, args.out_dir)
+            save_metric_pt_files(metrics_path, args.out_dir, args)
+            print(
+                f"[{step:6d}] mode={args.loss_mode} prior={prior_source} loss={loss.item():.4f} "
+                f"BCE={bce.item():.4f} first_BCE={first_pass_bce.item():.4f} "
+                f"tilt_BCE={prior_tilt_bce.item():.4f} residual_E={final_residual_energy.item():.3f} "
+                f"w_res={residual_weight:.2f} w_bce={bce_weight:.2f} "
+                f"coded_BER={coded_ber:.4e} L_A_abs={apriori_abs_mean:.2f} "
+                f"prior_scale={decoder_prior_damping:.2f} I_A~{i_a_mean:.2f} first_BER={first_pass_coded_ber:.4e}"
+            )
+            if do_online_test:
+                print(
+                    f"         online_test: first_coded_BER={online_first_coded_ber:.4e} "
+                    f"first_info_BER={online_first_info_ber:.4e} "
+                    f"second_coded_BER={online_second_coded_ber:.4e} "
+                    f"second_info_BER={online_second_info_ber:.4e}"
+                )
+
+        if step % args.save_every == 0 or step == args.steps:
+            ckpt = {"model": model.state_dict(), "args": vars(args), "step": step}
+            torch.save(ckpt, os.path.join(args.out_dir, "soft_idd_phase1.pt"))
+
+    make_plots(metrics_path, args.out_dir)
+    save_curves_pt(metrics_path, args.out_dir)
+    save_metric_pt_files(metrics_path, args.out_dir, args)
+    print(f"Phase-1 training complete. Checkpoint + curves in {args.out_dir}")
+    return model, coded_system, cfg
+
+
+# =============================================================================
+# Evaluation: BER vs SNR with baselines, and an EXIT-chart diagnostic (C8 + validation).
+# =============================================================================
+
+
+@torch.no_grad()
+def evaluate_ber_vs_snr(
+    model: SoftIDDDetector,
+    cfg_base: MIMOConfig,
+    args,
+    device: torch.device,
+) -> Dict[str, object]:
+    """Sweep SNR; report detector and post-LDPC coded-bit BER for several IDD iterations,
+    plus LMMSE / ZF baselines. One CodedSystem per SNR (sigma2 differs)."""
+    snr_list = [float(s) for s in args.eval_snr_db.split(",")]
+    results: Dict[str, object] = {"snr_db": snr_list}
+    det_ber_by_iter = {it: [] for it in range(1, args.num_idd_iter + 1)}
+    dec_ber_by_iter = {it: [] for it in range(1, args.num_idd_iter + 1)}
+    info_ber_by_iter = {it: [] for it in range(1, args.num_idd_iter + 1)}
+    lmmse_ber: List[float] = []
+    zf_ber: List[float] = []
+
+    for snr in snr_list:
+        cfg = MIMOConfig(Nt=cfg_base.Nt, Nr=cfg_base.Nr, snr_db=snr)
+        coded_system = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter,
+                                   device=device, cn_update=args.cn_update)
+        det_acc = {it: [] for it in det_ber_by_iter}
+        dec_acc = {it: [] for it in dec_ber_by_iter}
+        info_acc = {it: [] for it in info_ber_by_iter}
+        lm_acc: List[float] = []
+        zf_acc: List[float] = []
+
+        n_batches = max(1, args.eval_batches)
+        for _ in range(n_batches):
+            info_bits, coded_grid = coded_system.generate_coded_grid(args.eval_batch_size)
+            H = make_channel(args.eval_batch_size, cfg, device)
+            y, _ = transmit(H, coded_grid, cfg)
+
+            idd = run_idd_inference(
+                model, coded_system, H, y, coded_grid, info_bits, cfg,
+                K=args.K_test, num_idd_iter=args.num_idd_iter, init_mode=args.init_mode,
+            )
+            for it in det_ber_by_iter:
+                det_acc[it].append(idd["det_coded_ber"][it - 1])
+                dec_acc[it].append(idd["dec_coded_ber"][it - 1])
+                info_acc[it].append(idd["dec_info_ber"][it - 1])
+
+            lm_bits = linear_detector_bits(H, y, cfg.sigma2, kind="lmmse")
+            zf_bits = linear_detector_bits(H, y, cfg.sigma2, kind="zf")
+            lm_acc.append(bit_error_rate(lm_bits, coded_grid))
+            zf_acc.append(bit_error_rate(zf_bits, coded_grid))
+
+        for it in det_ber_by_iter:
+            det_ber_by_iter[it].append(float(np.mean(det_acc[it])))
+            dec_ber_by_iter[it].append(float(np.mean(dec_acc[it])))
+            info_vals = np.asarray(info_acc[it], dtype=float)
+            if np.isnan(info_vals).all():
+                info_ber_by_iter[it].append(float("nan"))
+            else:
+                info_ber_by_iter[it].append(float(np.nanmean(info_vals)))
+        lmmse_ber.append(float(np.mean(lm_acc)))
+        zf_ber.append(float(np.mean(zf_acc)))
+        print(f"SNR={snr:5.1f} dB | det_BER(it1)={det_ber_by_iter[1][-1]:.3e} "
+              f"det_BER(itN)={det_ber_by_iter[args.num_idd_iter][-1]:.3e} "
+              f"dec_BER(itN)={dec_ber_by_iter[args.num_idd_iter][-1]:.3e} "
+              f"LMMSE={lmmse_ber[-1]:.3e}")
+
+    results.update({
+        "det_ber_by_iter": det_ber_by_iter,
+        "dec_ber_by_iter": dec_ber_by_iter,
+        "info_ber_by_iter": info_ber_by_iter,
+        "lmmse_ber": lmmse_ber,
+        "zf_ber": zf_ber,
+    })
+    return results
+
+
+@torch.no_grad()
+def detector_exit_curve(
+    model: SoftIDDDetector,
+    cfg: MIMOConfig,
+    args,
+    device: torch.device,
+    i_a_grid_points: int = 11,
+) -> Dict[str, List[float]]:
+    """Measure the detector's EXIT transfer I_E vs I_A using the consistent-Gaussian model.
+
+    For each I_A: synthesize a-priori LLRs, run one detector pass, compute extrinsic LLRs,
+    and estimate the extrinsic mutual information I_E via the J-function of the extrinsic
+    LLR's empirical consistent-Gaussian std (sign-corrected by the true bits). A monotone,
+    not-too-steep curve indicates healthy (no double-counting) information transfer.
+    """
+    model.eval()
+    coded_system = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter,
+                               device=device, cn_update=args.cn_update)
+    i_a_axis = [i / (i_a_grid_points - 1) for i in range(i_a_grid_points)]
+    i_e_axis: List[float] = []
+
+    for i_a_val in i_a_axis:
+        info_bits, coded_grid = coded_system.generate_coded_grid(args.eval_batch_size)
+        H = make_channel(args.eval_batch_size, cfg, device)
+        y, _ = transmit(H, coded_grid, cfg)
+        i_a_t = torch.full((args.eval_batch_size, cfg.Nt, BITS_PER_SYMBOL), i_a_val, device=device)
+        apriori = sample_apriori_llr(coded_grid, i_a_t, llr_clip=args.llr_clip)
+        init_bits = initialize_candidates(H, y, cfg.sigma2, args.K_test, mode=args.init_mode)
+        out = model(H, y, cfg.sigma2, init_bits, apriori_llr=apriori, sample=True)
+        post = posterior_llr_from_tilt(out["final_tilt_prob"])
+        ext = extrinsic_llr(post, apriori)
+        # Sign-correct by true bits: z = (1-2b) * L_E should be > 0 on average; its
+        # consistent-Gaussian std maps back to mutual information via J(.).
+        sign = 1.0 - 2.0 * coded_grid
+        z = sign * ext
+        sigma_eff = z.mean().clamp_min(1e-4).sqrt() * math.sqrt(2.0)  # mu = sigma^2/2 -> sigma = sqrt(2 mu)
+        i_e = float(j_function(sigma_eff.reshape(1)).item())
+        i_e_axis.append(i_e)
+
+    return {"i_a": i_a_axis, "i_e": i_e_axis}
+
+
+# =============================================================================
+# P0 sanity check: coded round-trip with an EXACT soft demapper (no neural detector).
+# Catches LLR sign/scale convention bugs before the detector is trusted.
+# =============================================================================
+
+
+@torch.no_grad()
+def exact_soft_demap_llr(H: torch.Tensor, y: torch.Tensor, sigma2: float) -> torch.Tensor:
+    """Per-stream max-log per-bit LLRs for 256-QAM under y = Hx + n.
+
+    Returns L = log p(b=0)/p(b=1) of shape (B, Nt, 8). This is exact for decoupled
+    streams (e.g. identity/diagonal H). For dense random MIMO it is an approximate
+    per-stream demapper: the other streams are hard-cancelled using the LMMSE estimate,
+    then each stream is marginalized over the 256-QAM constellation.
+    """
+    B, Nr, Nt = H.shape
+    device = H.device
+    const_bits, const_syms = qam_constellation(device)  # (256,8), (256,)
+    x_lmmse = bits_to_qam(linear_detector_bits(H, y, sigma2, kind="lmmse"))  # (B,Nt)
+
+    llr = torch.zeros(B, Nt, BITS_PER_SYMBOL, device=device)
+    for i in range(Nt):
+        # Cancel interference from the other streams using the LMMSE hard estimate.
+        interf = torch.matmul(H, x_lmmse[..., None]).squeeze(-1) - H[:, :, i] * x_lmmse[:, i][:, None]
+        yi = y - interf  # (B, Nr)
+        hi = H[:, :, i]  # (B, Nr)
+        # Distance to each constellation point for stream i.
+        diff = yi[:, None, :] - hi[:, None, :] * const_syms[None, :, None]
+        metric = -(diff.abs() ** 2).sum(dim=-1).real / sigma2  # (B, 256) log-likelihood
+        for b in range(BITS_PER_SYMBOL):
+            mask0 = (const_bits[:, b] == 0.0)
+            m0 = metric[:, mask0].max(dim=1).values
+            m1 = metric[:, ~mask0].max(dim=1).values
+            llr[:, i, b] = m0 - m1  # log p0/p1 (max-log)
+    return llr
+
+
+@torch.no_grad()
+def p0_sanity_check(args) -> None:
+    """Check LDPC LLR convention and the controlled demap/decode round-trip.
+
+    The full 8x8 256-QAM random-MIMO APP demapper is too large for an exact P0 gate
+    (256^8 joint states). Therefore this sanity check separates:
+      1) perfect-LLR LDPC sign/interleaver gate,
+      2) identity-channel exact per-stream demapper gate,
+      3) random-MIMO approximate-demapper probe.
+    """
+    device = torch.device(args.device if (torch.cuda.is_available() or args.device == "cpu") else "cpu")
+    set_seed(args.seed)
+    print("\n=== P0 sanity check: LDPC sign + controlled soft-demapper round-trip ===")
+    cfg0 = MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=20.0)
+    cs0 = CodedSystem(cfg0, coderate=args.coderate, num_bp_iter=args.bp_iter, device=device, cn_update=args.cn_update)
+    info0, coded0 = cs0.generate_coded_grid(args.eval_batch_size)
+    perfect_llr = (1.0 - 2.0 * coded0) * args.llr_clip  # internal convention: log p0/p1
+    _, info_hat0 = cs0.decode_to_apriori(perfect_llr)
+    print(f"Perfect-LLR LDPC gate | post-LDPC info_BER={bit_error_rate(info_hat0, info0):.3e}")
+
+    for snr in [float(s) for s in args.eval_snr_db.split(",")]:
+        cfg = MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=snr)
+        cs = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter, device=device, cn_update=args.cn_update)
+        info_bits, coded_grid = cs.generate_coded_grid(args.eval_batch_size)
+
+        # Controlled channel: H=I makes the per-stream 256-QAM demapper exact and
+        # isolates LDPC/LLR convention from random-MIMO detector quality.
+        H_eye = torch.zeros(args.eval_batch_size, cfg.Nr, cfg.Nt, dtype=torch.complex64, device=device)
+        diag_len = min(cfg.Nr, cfg.Nt)
+        diag_idx = torch.arange(diag_len, device=device)
+        H_eye[:, diag_idx, diag_idx] = 1.0 + 0.0j
+        x = bits_to_qam(coded_grid)
+        noise = complex_normal((args.eval_batch_size, cfg.Nr), device=device, scale=math.sqrt(cfg.sigma2))
+        y_eye = torch.matmul(H_eye, x[..., None]).squeeze(-1) + noise
+        llr = exact_soft_demap_llr(H_eye, y_eye, cfg.sigma2)  # (B,Nt,8) log p0/p1
+        det_bits = (llr_to_bit_prob(llr) >= 0.5).float()
+        det_ber = bit_error_rate(det_bits, coded_grid)
+        _, info_hat = cs.decode_to_apriori(llr)
+        info_ber = bit_error_rate(info_hat, info_bits) if cs.sionna else float("nan")
+        print(f"Identity H SNR={snr:5.1f} dB | demap coded_BER={det_ber:.3e} | post-LDPC info_BER={info_ber:.3e}")
+
+    print("\n--- Random-MIMO approximate demapper probe (not a pass/fail P0 gate) ---")
+    for snr in [float(s) for s in args.eval_snr_db.split(",")]:
+        cfg = MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=snr)
+        cs = CodedSystem(cfg, coderate=args.coderate, num_bp_iter=args.bp_iter, device=device, cn_update=args.cn_update)
+        info_bits, coded_grid = cs.generate_coded_grid(args.eval_batch_size)
+        H = make_channel(args.eval_batch_size, cfg, device)
+        y, _ = transmit(H, coded_grid, cfg)
+        llr = exact_soft_demap_llr(H, y, cfg.sigma2)
+        det_bits = (llr_to_bit_prob(llr) >= 0.5).float()
+        det_ber = bit_error_rate(det_bits, coded_grid)
+        _, info_hat = cs.decode_to_apriori(llr)
+        info_ber = bit_error_rate(info_hat, info_bits) if cs.sionna else float("nan")
+        print(f"Random MIMO SNR={snr:5.1f} dB | approx demap coded_BER={det_ber:.3e} | post-LDPC info_BER={info_ber:.3e}")
+    print("=== P0 passes if the perfect-LLR gate is 0 and identity-H post-LDPC info_BER -> 0 at high SNR. ===\n")
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
+
+
+def read_numeric_metric_rows(metrics_path: str) -> Tuple[List[Dict[str, object]], List[str]]:
+    """Read a metrics CSV and keep numeric curves in 5_20_2-style plotting helpers."""
+    if not os.path.exists(metrics_path):
+        return [], []
+    rows: List[Dict[str, object]] = []
+    with open(metrics_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        for raw in reader:
+            row: Dict[str, object] = {}
+            for key, value in raw.items():
+                try:
+                    row[key] = float(value)
+                except (TypeError, ValueError):
+                    row[key] = value
+            rows.append(row)
+    return rows, fieldnames
+
+
+def numeric_series(rows: List[Dict[str, object]], name: str) -> Optional[List[float]]:
+    if not rows or name not in rows[0]:
+        return None
+    values: List[float] = []
+    for row in rows:
+        value = row.get(name, float("nan"))
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+        else:
+            return None
+    return values
+
+
+def save_curves_pt(metrics_path: str, out_dir: str, filename: str = "curve_data.pt") -> None:
+    rows, fieldnames = read_numeric_metric_rows(metrics_path)
+    if not rows:
+        return
+    curves: Dict[str, torch.Tensor] = {}
+    numeric_fieldnames: List[str] = []
+    for key in fieldnames:
+        values = numeric_series(rows, key)
+        if values is None:
+            continue
+        numeric_fieldnames.append(key)
+        curves[key] = torch.tensor(values, dtype=torch.float32)
+    if not curves:
+        return
+    payload = {
+        "format": "soft_idd_curve_data",
+        "version": 1,
+        "source_csv": os.path.abspath(metrics_path),
+        "fieldnames": numeric_fieldnames,
+        "steps": curves.get("step", torch.arange(len(rows), dtype=torch.float32)),
+        "curves": curves,
+    }
+    torch.save(payload, os.path.join(out_dir, filename))
+
+
+def save_metric_pt_files(metrics_path: str, out_dir: str, args) -> None:
+    rows, _fieldnames = read_numeric_metric_rows(metrics_path)
+    if not rows:
+        return
+    steps_values = numeric_series(rows, "step")
+    if steps_values is None:
+        return
+    steps = torch.tensor(steps_values, dtype=torch.float32)
+
+    curve_specs = [
+        ("first_pass_coded_ber", "train_first_round_coded_ber.pt"),
+        ("train_coded_ber", "train_second_round_coded_ber.pt"),
+    ]
+    for metric_name, filename in curve_specs:
+        values = numeric_series(rows, metric_name)
+        if values is None:
+            continue
+        payload = {
+            "format": "soft_idd_single_curve",
+            "version": 1,
+            "source_csv": os.path.abspath(metrics_path),
+            "metric_name": metric_name,
+            "steps": steps,
+            "values": torch.tensor(values, dtype=torch.float32),
+        }
+        torch.save(payload, os.path.join(out_dir, filename))
+
+    first = numeric_series(rows, "first_pass_coded_ber")
+    second = numeric_series(rows, "train_coded_ber")
+    if first is not None and second is not None:
+        payload = {
+            "format": "soft_idd_train_coded_ber_trace",
+            "version": 1,
+            "source_csv": os.path.abspath(metrics_path),
+            "metadata": {
+                "description": "Logged train coded-bit BER before/after decoder-derived prior tilt.",
+                "first_round_coded_ber": "Detector posterior coded BER with L_A=0 before the LDPC decoder prior.",
+                "second_round_coded_ber": "Detector posterior coded BER after one decoder prior and prior-tilted sampling.",
+                "log_every": int(args.log_every),
+                "snr_db": float(args.snr_db),
+                "K_train": int(args.K_train),
+                "init_mode": str(args.init_mode),
+                "weight_init": str(args.weight_init),
+                "prior_source": str(args.prior_source),
+                "loss_mode": str(args.loss_mode),
+            },
+            "step": steps.to(dtype=torch.long),
+            "first_round_coded_ber": torch.tensor(first, dtype=torch.float32),
+            "second_round_coded_ber": torch.tensor(second, dtype=torch.float32),
+        }
+        torch.save(payload, os.path.join(out_dir, args.train_ber_trace_name))
+
+
+def make_plots(metrics_path: str, out_dir: str) -> None:
+    rows, _fieldnames = read_numeric_metric_rows(metrics_path)
+    if not rows:
+        return
+    steps = numeric_series(rows, "step")
+    if steps is None:
+        return
+
+    plt.figure()
+    for key, label in [
+        ("first_pass_coded_ber", "Train first round (before decoder prior)"),
+        ("train_coded_ber", "Train second round (after decoder prior)"),
+        ("online_first_coded_ber", "Online first round"),
+        ("online_second_coded_ber", "Online second round"),
+    ]:
+        values = numeric_series(rows, key)
+        if values is not None and any(math.isfinite(v) for v in values):
+            plt.semilogy(steps, [max(v, 1e-6) if math.isfinite(v) else float("nan") for v in values], label=label)
+    plt.xlabel("Training step")
+    plt.ylabel("coded-bit BER")
+    plt.title("BER convergence")
+    plt.grid(True, which="both")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ber_convergence.png"), dpi=200)
+    plt.savefig(os.path.join(out_dir, "phase1_coded_ber.png"), dpi=200)
+    plt.close()
+
+    plt.figure()
+    for key, label in [
+        ("train_bce", "Train BCE"),
+        ("first_pass_bce", "First-pass BCE"),
+        ("prior_tilt_bce", "Prior-tilt BCE"),
+        ("loss", "Total loss"),
+    ]:
+        values = numeric_series(rows, key)
+        if values is not None and any(math.isfinite(v) for v in values):
+            plt.plot(steps, values, label=label)
+    plt.xlabel("Training step")
+    plt.ylabel("Loss")
+    plt.title("Training loss convergence")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "training_loss_convergence.png"), dpi=200)
+    plt.savefig(os.path.join(out_dir, "phase1_bce.png"), dpi=200)
+    plt.close()
+
+    plt.figure()
+    for key, label in [
+        ("train_residual_energy", "Train residual energy"),
+        ("apriori_abs_mean", "|L_A| mean"),
+        ("decoder_prior_damping", "Decoder prior scale"),
+    ]:
+        values = numeric_series(rows, key)
+        if values is not None and any(math.isfinite(v) for v in values):
+            plt.plot(steps, values, label=label)
+    plt.xlabel("Training step")
+    plt.ylabel("Value")
+    plt.title("Residual / prior diagnostics")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "residual_prior_diagnostics.png"), dpi=200)
+    plt.close()
+
+
+def plot_ber_vs_snr(results: Dict[str, object], num_idd_iter: int, out_dir: str) -> None:
+    snr = results["snr_db"]
+    det = results["det_ber_by_iter"]
+    dec = results["dec_ber_by_iter"]
+
+    plt.figure()
+    for it in [1, num_idd_iter] if num_idd_iter > 1 else [1]:
+        plt.semilogy(snr, [max(v, 1e-6) for v in det[it]], marker="o", label=f"detector coded BER (IDD {it})")
+        plt.semilogy(snr, [max(v, 1e-6) for v in dec[it]], marker="s", linestyle="--",
+                     label=f"post-LDPC coded BER (IDD {it})")
+    plt.semilogy(snr, [max(v, 1e-6) for v in results["lmmse_ber"]], marker="x", color="gray", label="LMMSE")
+    plt.xlabel("SNR (dB)"); plt.ylabel("coded BER"); plt.title("Soft-IDD BER vs SNR")
+    plt.grid(True, which="both"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ber_vs_snr.png"), dpi=180); plt.close()
+
+    # IDD convergence at the best (highest) SNR point.
+    plt.figure()
+    iters = list(range(1, num_idd_iter + 1))
+    best = -1
+    plt.semilogy(iters, [max(det[it][best], 1e-6) for it in iters], marker="o", label="detector coded BER")
+    plt.semilogy(iters, [max(dec[it][best], 1e-6) for it in iters], marker="s", label="post-LDPC coded BER")
+    plt.xlabel("IDD iteration"); plt.ylabel("coded BER")
+    plt.title(f"IDD convergence @ {snr[best]:.0f} dB")
+    plt.grid(True, which="both"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "idd_convergence.png"), dpi=180); plt.close()
+
+
+def plot_exit(exit_curve: Dict[str, List[float]], out_dir: str) -> None:
+    plt.figure()
+    plt.plot(exit_curve["i_a"], exit_curve["i_e"], marker="o", label="detector I_E vs I_A")
+    plt.plot([0, 1], [0, 1], linestyle=":", color="gray", label="reference y=x")
+    plt.xlabel("I_A (a-priori MI)"); plt.ylabel("I_E (extrinsic MI)")
+    plt.title("Detector EXIT curve")
+    plt.xlim(0, 1); plt.ylim(0, 1)
+    plt.grid(True); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "exit_chart.png"), dpi=180); plt.close()
+
+
+# =============================================================================
+# Argument parsing and main
+# =============================================================================
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Phase-1 soft-IDD MIMO detection (8x8 256-QAM, 5G LDPC).")
+    # System
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out-dir", type=str, default="soft_idd_results")
+    p.add_argument("--Nt", type=int, default=8)
+    p.add_argument("--Nr", type=int, default=8)
+    p.add_argument("--snr-db", type=float, default=25.0, help="Training SNR.")
+    p.add_argument("--coderate", type=float, default=0.5)
+    p.add_argument("--bp-iter", type=int, default=20, help="LDPC BP iterations per decode call.")
+    p.add_argument("--cn-update", type=str, default="minsum", choices=["minsum", "boxplus-phi", "boxplus"])
+    # Model
+    p.add_argument("--layers", type=int, default=8)
+    p.add_argument("--d-model", type=int, default=128)
+    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--d-ff", type=int, default=256)
+    p.add_argument("--init-bit-prob", type=float, default=0.5)
+    p.add_argument("--weight-init", type=str, default="warmstart", choices=["warmstart", "random"],
+                   help="Network weight initialization: load the hard detector checkpoint or train from random weights.")
+    p.add_argument(
+        "--warmstart",
+        type=str,
+        default=os.path.join("mimo_l2a_results", "5_20_4_results", "CL", "mimo_l2a_transformer.pt"),
+        help="Path to a hard-decision checkpoint to warm-start from.",
+    )
+    # Training
+    p.add_argument("--steps", type=int, default=20000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--K-train", type=int, default=16,
+                   help="Parallel detector particles during training; averaged/credited as a population, not selected.")
+    p.add_argument("--loss-mode", type=str, default="pure_bce", choices=["pure_bce", "residual_hybrid"],
+                   help="Phase-1 objective: pure BCE, or residual-to-hybrid residual/BCE curriculum.")
+    p.add_argument("--metric-residual-until", type=int, default=2000,
+                   help="For residual_hybrid: keep the curriculum pure residual through this step.")
+    p.add_argument("--metric-hybrid-from", type=int, default=10000,
+                   help="For residual_hybrid: finish the transition to residual/BCE hybrid by this step.")
+    p.add_argument("--metric-residual-floor", type=float, default=0.1,
+                   help="For residual_hybrid: residual weight retained after the transition.")
+    p.add_argument("--advantage-clip", type=float, default=3.0,
+                   help="For residual_hybrid: clip standardized score-function advantages.")
+    p.add_argument("--prior-source", type=str, default="decoder_onepass",
+                   choices=["gaussian", "decoder_onepass", "mixed"],
+                   help="Training a-priori LLR source: EXIT-style Gaussian, one detector->decoder pass, or mixed.")
+    p.add_argument("--first-pass-bce-weight", type=float, default=1.0,
+                   help="Auxiliary BCE weight on the no-prior first detector pass.")
+    p.add_argument("--decoder-prior-damping-start", type=float, default=0.25,
+                   help="Decoder-prior scale while the first-pass detector BER is still high.")
+    p.add_argument("--decoder-prior-damping-end", type=float, default=1.0,
+                   help="Decoder-prior scale once the first-pass detector BER is low enough.")
+    p.add_argument("--decoder-prior-ramp-ber-high", type=float, default=0.35,
+                   help="Use decoder-prior-damping-start at or above this first-pass coded BER.")
+    p.add_argument("--decoder-prior-ramp-ber-low", type=float, default=0.15,
+                   help="Use decoder-prior-damping-end at or below this first-pass coded BER.")
+    p.add_argument("--decoder-prior-prob", type=float, default=0.5,
+                   help="For prior-source=mixed: probability of using decoder_onepass instead of Gaussian.")
+    p.add_argument("--i-a-mode", type=str, default="uniform", choices=["uniform", "beta"])
+    p.add_argument("--llr-clip", type=float, default=20.0)
+    p.add_argument("--init-mode", type=str, default="lmmse", choices=["lmmse", "random"],
+                   help="Initial solution for each detector particle/simulator.")
+    p.add_argument("--log-every", type=int, default=20,
+                   help="Record metrics, update PT curve files, and refresh plots every N training steps.")
+    p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--test-every", type=int, default=100,
+                   help="Run an on-the-fly two-pass detector/decoder test every N training steps; <=0 disables it.")
+    p.add_argument("--test-batch-size", type=int, default=128,
+                   help="Batch size for on-the-fly two-pass tests.")
+    p.add_argument("--test-batches", type=int, default=1,
+                   help="Number of batches for each on-the-fly two-pass test.")
+    p.add_argument("--train-ber-trace-name", type=str, default="train_coded_ber_trace.pt",
+                   help="PT filename for logged first/second-round train coded BER curves.")
+    p.add_argument("--run-startup-benchmarks", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run ZF/LMMSE/list-MAP coded/info BER benchmarks before training.")
+    p.add_argument("--benchmark-batch-size", type=int, default=64,
+                   help="Batch size for startup detection benchmarks.")
+    p.add_argument("--benchmark-batches", type=int, default=1,
+                   help="Number of batches for startup detection benchmarks.")
+    p.add_argument("--benchmark-hard-llr-mag", type=float, default=8.0,
+                   help="Fixed internal LLR magnitude used when decoding hard ZF/LMMSE decisions.")
+    p.add_argument("--listmap-width", type=int, default=128,
+                   help="K-best beam width for startup list-MAP benchmark.")
+    # Eval / IDD
+    p.add_argument("--K-test", type=int, default=16,
+                   help="Parallel detector particles for soft posterior averaging; no final candidate selection is used.")
+    p.add_argument("--num-idd-iter", type=int, default=3)
+    p.add_argument("--eval-snr-db", type=str, default="8,12,16,20,24")
+    p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument("--eval-batches", type=int, default=8)
+    # Modes
+    p.add_argument("--mode", type=str, default="all", choices=["all", "p0", "train", "eval"],
+                   help="p0=sanity check only; train=Phase-1 training; eval=load+evaluate; all=p0+train+eval.")
+    p.add_argument("--ckpt", type=str, default="", help="Checkpoint to load for eval mode.")
+    return p
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+    device = torch.device(args.device if (torch.cuda.is_available() or args.device == "cpu") else "cpu")
+    set_seed(args.seed)
+
+    if args.mode in ("all", "p0"):
+        p0_sanity_check(args)
+        if args.mode == "p0":
+            return
+
+    cfg = MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=args.snr_db)
+
+    if args.mode in ("all", "train"):
+        model, _coded_system, _cfg = train_phase1(args)
+    else:  # eval
+        model = SoftIDDDetector(Nt=cfg.Nt, d_model=args.d_model, num_heads=args.heads,
+                                d_ff=args.d_ff, T=args.layers, init_bit_prob=args.init_bit_prob).to(device)
+        ckpt_path = args.ckpt or os.path.join(args.out_dir, "soft_idd_phase1.pt")
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state["model"] if "model" in state else state)
+        print(f"Loaded checkpoint {ckpt_path}")
+
+    if args.mode in ("all", "train", "eval"):
+        print("\n=== Evaluating BER vs SNR ===")
+        results = evaluate_ber_vs_snr(model, cfg, args, device)
+        plot_ber_vs_snr(results, args.num_idd_iter, args.out_dir)
+
+        print("\n=== Detector EXIT curve (loop-health diagnostic) ===")
+        exit_curve = detector_exit_curve(model, MIMOConfig(Nt=args.Nt, Nr=args.Nr, snr_db=args.snr_db), args, device)
+        plot_exit(exit_curve, args.out_dir)
+        print("EXIT I_A:", [round(v, 2) for v in exit_curve["i_a"]])
+        print("EXIT I_E:", [round(v, 3) for v in exit_curve["i_e"]])
+        print(f"\nAll outputs written to {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
