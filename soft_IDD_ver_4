@@ -3456,7 +3456,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--Nt", type=int, default=8)
     p.add_argument("--Nr", type=int, default=8)
     p.add_argument("--snr-db", type=float, default=30.0, help="Training SNR.")
-    p.add_argument("--coherence-periods", type=int, default=10,
+    p.add_argument("--coherence-periods", type=int, default=20,
                    help="Number of independent CSI periods concatenated into one LDPC codeword.")
     p.add_argument("--coderate", type=float, default=0.5)
     p.add_argument("--bp-iter", type=int, default=20, help="LDPC BP iterations per decode call.")
@@ -3478,7 +3478,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     # Training
     p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
