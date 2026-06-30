@@ -3472,7 +3472,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--warmstart",
         type=str,
-        default=os.path.join("mimo_l2a_results", "5_20_4_results", "CL", "mimo_l2a_transformer.pt"),
+        # default=os.path.join("mimo_l2a_results", "5_20_4_results", "CL", "mimo_l2a_transformer.pt"),
+        default=os.path.join("mimo_l2a_transformer.pt"),
         help="Path to a hard-decision checkpoint to warm-start from.",
     )
     # Training
