@@ -3448,13 +3448,13 @@ def plot_exit(exit_curve: Dict[str, List[float]], out_dir: str) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Phase-1 soft-IDD MIMO detection (8x8 256-QAM, 5G LDPC).")
+    p = argparse.ArgumentParser(description="Phase-1 soft-IDD MIMO detection (16x16 256-QAM, 5G LDPC).")
     # System
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out-dir", type=str, default="soft_idd_results")
-    p.add_argument("--Nt", type=int, default=8)
-    p.add_argument("--Nr", type=int, default=8)
+    p.add_argument("--Nt", type=int, default=16)
+    p.add_argument("--Nr", type=int, default=16)
     p.add_argument("--snr-db", type=float, default=30.0, help="Training SNR.")
     p.add_argument("--coherence-periods", type=int, default=20,
                    help="Number of independent CSI periods concatenated into one LDPC codeword.")
@@ -3463,8 +3463,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--cn-update", type=str, default="minsum", choices=["minsum", "boxplus-phi", "boxplus"])
     # Model
     p.add_argument("--layers", type=int, default=8)
-    p.add_argument("--d-model", type=int, default=128)
-    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--d-model", type=int, default=256)
+    p.add_argument("--heads", type=int, default=8)
     p.add_argument("--d-ff", type=int, default=256)
     p.add_argument("--init-bit-prob", type=float, default=0.5)
     p.add_argument("--weight-init", type=str, default="warmstart", choices=["warmstart", "random"],
